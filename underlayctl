@@ -1,0 +1,363 @@
+#!/usr/bin/env bash
+
+set -o errexit
+set -o errtrace
+set -o pipefail
+
+PACKAGE='underlayctl'
+
+FORCE_SETUP_IF_EXISTS=0
+BROADCAST_MAC='00:00:00:00:00:00'
+ROUTER_ARP_PROXY=0
+CHECK_CONFIG=0
+EXECUTE_AFTER_DEPLOY=1
+
+function SetUpVxLAN() {
+    PARENT_DEV=$1
+    VXLAN_DEV=$2
+    VNID=$3
+    UDP_PORT=$4
+
+    if [ "$(ifconfig | grep -q "$VXLAN_DEV")" != '0' ]; then
+        if [ $FORCE_SETUP_IF_EXISTS -eq 0 ]; then
+            return 1
+        fi
+        sudo ip link del "$VXLAN_DEV"
+    fi
+
+    sudo ip link add link "$PARENT_DEV" name "$VXLAN_DEV" type vxlan id "$VNID" dstport "$UDP_PORT" learning
+    sudo ip link set "$VXLAN_DEV" up
+
+    return 0
+}
+
+function AppendNewFDBEntry() {
+    VXLAN_DEV=$1
+    REMOTE_IP=$2
+
+    if [ "$(bridge fdb show | grep -q "dev $VXLAN_DEV dst $REMOTE_IP")" != '0' ]; then
+        bridge fdb append "$BROADCAST_MAC" dev "$VXLAN_DEV" dst "$REMOTE_IP" self permanent
+    fi
+}
+
+function WorkAsGateway() {
+    VXLAN_DEV=$1
+    UNDERLAY_IP=$2
+    UNDERLAY_CIDR=$3
+
+    sudo ip route replace "$UNDERLAY_CIDR" dev "$VXLAN_DEV" proto kernel scope link src "$UNDERLAY_IP"
+}
+
+function ConfigSingleNetwork() {
+    CONFIG=$1
+
+    VXLAN_DEV=$(grep "dev" "$CONFIG" 2>/dev/null | awk '{print $2}')
+    PARENT_DEV=$(grep "parent" "$CONFIG" 2>/dev/null | awk '{print $2}')
+    VNID=$(grep "vnid" "$CONFIG" 2>/dev/null | awk '{print $2}')
+    CIDR=$(grep "cidr" "$CONFIG" 2>/dev/null | awk '{print $2}')
+    PORT=$(grep "port" "$CONFIG" 2>/dev/null | awk '{print $2}')
+
+    NODES=()
+    IPS=()
+    GATEWAY_NODE=""
+
+    NODES_START_FROM=$(awk '/nodes:/{print NR}' "$CONFIG")
+    NODES_CFG="$(awk "NR>$NODES_START_FROM" "$CONFIG")"
+
+    declare -i idx=-1
+
+    while read -r config || [ -n "$config" ]
+    do
+        if [ -z "$config" ]; then
+            continue
+        fi
+
+        if [[ $config == -* ]]; then
+            idx+=1
+            config=${config#"-"}
+        fi
+
+        key=$(echo "$config" | awk '{print $1}')
+        key=${key%":"}
+        val=$(echo "$config" | awk '{print $2}')
+
+        case $key in
+        node)
+          NODES[$idx]=$val
+          ;;
+        ip)
+          IPS[$idx]=$val
+          ;;
+        gateway)
+          if [ "$val" == "true" ]; then
+              GATEWAY_NODE=$idx
+          fi
+          ;;
+        esac
+    done <<< "$NODES_CFG"
+
+    GATEWAY_NODE=${NODES[$GATEWAY_NODE]}
+
+    if [ $CHECK_CONFIG -ne 0 ]; then
+        echo "Load from '$CONFIG':"
+        echo "[$CIDR] [dev=$VXLAN_DEV, parent=$PARENT_DEV, vnid=$VNID, port=$PORT]"
+        for (( i = 0; i < ${#NODES[@]}; i++ )); do
+            NODE=${NODES[$i]}
+            IP=${IPS[$i]}
+            IS_GATEWAY='no'
+            if [ "$NODE" == "$GATEWAY_NODE" ]; then
+                IS_GATEWAY='yes'
+            fi
+            echo "[$i] [node=$NODE, ip=$IP, is-gateway=$IS_GATEWAY]"
+        done
+
+        read -r -p "Proceed[y/n]: " proceed
+        if [ "$proceed" != "y" ]; then
+            echo "quit this underlay network config"
+            return 1
+        fi
+    fi
+
+    for (( i = 0; i < ${#NODES[@]}; i++ )); do
+        NODE=${NODES[$i]}
+        scp underlayctl root@"$NODE":.
+        echo "deploy client to $NODE"
+    done
+
+    if [ $EXECUTE_AFTER_DEPLOY -ne 1 ]; then
+        return 0
+    fi
+
+    for (( i = 0; i < ${#NODES[@]}; i++ )); do
+        SLAVE_ARGS="--underlay-dev=$VXLAN_DEV --parent-dev=$PARENT_DEV --net-id=$VNID --udp-port=$PORT"
+
+        if [ $FORCE_SETUP_IF_EXISTS -ne 0 ]; then
+            SLAVE_ARGS="$SLAVE_ARGS --force"
+        fi
+
+        NODE=${NODES[$i]}
+        IP=${IPS[$i]}
+
+        if [ -n "$IP" ]; then
+            SLAVE_ARGS="$SLAVE_ARGS --local-underlay-ip=$IP"
+        fi
+
+        if [ "$NODE" == "$GATEWAY_NODE" ]; then
+            SLAVE_ARGS="$SLAVE_ARGS --as-gateway=$CIDR"
+        fi
+
+        # shellcheck disable=SC2029
+        ssh root@"$NODE" "./underlayctl slave $SLAVE_ARGS"
+    done
+
+    echo "$CONFIG configured!"
+}
+
+function ssh-no-password() {
+    while test $# -gt 0; do
+      case "$1" in
+          -h|--help)
+          echo "$PACKAGE-ssh-no-password - ssh without type password each time"
+          echo " "
+          echo "$PACKAGE ssh-no-password [options] [nodes]"
+          echo " "
+          echo "options:"
+          echo "-h, --help                show brief help"
+          exit 0
+          ;;
+        *)
+          break
+          ;;
+      esac
+    done
+
+    ssh-keygen
+
+    while test $# -gt 0; do
+      IP=$1
+      echo "copy ssh key to $IP"
+      ssh-copy-id root@"$IP"
+      shift
+    done
+}
+
+function master() {
+    while test $# -gt 0; do
+      case "$1" in
+          -h|--help)
+          echo "$PACKAGE-master - master client for underlay mocker using vxlan tunnel"
+          echo " "
+          echo "$PACKAGE master [options] [files]"
+          echo " "
+          echo "options:"
+          echo "-h, --help                   show brief help"
+          echo "--check-config               display underlay network config and decide whether to proceed"
+          echo "--force                      force to set up an underlay device even if it already exists"
+          echo "--no-execute-slave           do not execute slave client after the deployment"
+          exit 0
+          ;;
+        --check-config)
+          CHECK_CONFIG=1
+          shift
+          ;;
+        --force)
+          FORCE_SETUP_IF_EXISTS=1
+          shift
+          ;;
+        --no-execute-slave)
+          EXECUTE_AFTER_DEPLOY=0
+          shift
+          ;;
+        *)
+          break
+          ;;
+      esac
+    done
+
+    while test $# -gt 0; do
+      CONFIG=$1
+      if [ ! -f "$CONFIG" ]; then
+          echo "file not exists: $CONFIG"
+          exit 1
+      fi
+
+      ConfigSingleNetwork "$CONFIG"
+      shift
+    done
+}
+
+function slave() {
+    VXLAN_DEV=""
+    PARENT_DEV=""
+    VNID=""
+    PORT=""
+    UNDERLAY_IP=""
+    AS_GATEWAY=""
+
+    while test $# -gt 0; do
+      case "$1" in
+          -h|--help)
+          echo "$PACKAGE-slave - slave client for underlay mocker using vxlan tunnel"
+          echo " "
+          echo "$PACKAGE slave [options] [nodes]"
+          echo " "
+          echo "options:"
+          echo "-h, --help                   show brief help"
+          echo "--local-underlay-ip=IP       set an underlay network ip for this node"
+          echo "--underlay-dev=DEV_NAME      designate a name for the device on underlay network"
+          echo "--parent-dev=DEV_NAME        specify the parent device from which underlay device is derived"
+          echo "--net-id=ID                  specify the vnid for vxlan tunnel for underlay traffic"
+          echo "--udp-port=PORT              specify the udp port of vxlan tunnel for underlay traffic"
+          echo "--as-gateway=CIDR            work as a gateway for the underlay network"
+          echo "--force                      force to set up an underlay device even if it already exists"
+          exit 0
+          ;;
+        --local-underlay-ip*)
+          UNDERLAY_IP=`echo $1 | sed -e 's/^[^=]*=//g'`
+          shift
+          ;;
+        --underlay-dev*)
+          VXLAN_DEV=`echo $1 | sed -e 's/^[^=]*=//g'`
+          shift
+          ;;
+        --parent-dev*)
+          PARENT_DEV=`echo $1 | sed -e 's/^[^=]*=//g'`
+          shift
+          ;;
+        --net-id*)
+          VNID=`echo $1 | sed -e 's/^[^=]*=//g'`
+          shift
+          ;;
+        --udp-port*)
+          PORT=`echo $1 | sed -e 's/^[^=]*=//g'`
+          shift
+          ;;
+        --as-gateway)
+          AS_GATEWAY=`echo $1 | sed -e 's/^[^=]*=//g'`
+          shift
+          ;;
+        --force)
+          FORCE_SETUP_IF_EXISTS=1
+          shift
+          ;;
+        *)
+          break
+          ;;
+      esac
+    done
+
+    SetUpVxLAN "$VXLAN_DEV" "$PARENT_DEV" "$VNID" "$PORT"
+    retVal=$?
+
+    if [ $retVal -ne 0 ]; then
+        echo "[1] $VXLAN_DEV already exists, skip this step."
+    else
+        echo "[1] $VXLAN_DEV installed!"
+    fi
+
+    if [ -n "$UNDERLAY_IP" ]; then
+        sudo ip addr add "$UNDERLAY_IP" dev "$VXLAN_DEV"
+        echo "[1] Assign $UNDERLAY_IP to $VXLAN_DEV"
+    fi
+
+    while test $# -gt 0; do
+      AppendNewFDBEntry "$VXLAN_DEV" "$1"
+      shift
+    done
+
+    echo "[2] fdb on dev $VXLAN_DEV configured!"
+
+    if [ -n "$AS_GATEWAY" ]; then
+      if [ -z "$UNDERLAY_IP" ]; then
+          echo "[3] failed to work as gateway: no underlay ip assigned"
+          exit 1
+      fi
+      WorkAsGateway "$VXLAN_DEV" "$UNDERLAY_IP" "$AS_GATEWAY"
+      echo "[3] work as gateway node: done"
+    else
+      echo "[3] work as normal node: done"
+    fi
+}
+
+function help() {
+    echo "$PACKAGE - client for underlay mocker using vxlan tunnel"
+    echo " "
+    echo "$PACKAGE tool [-h|--help] [options] [other arguments]"
+    echo " "
+    echo "tools:"
+    echo "ssh-no-password       allow master connecting to slave without password"
+    echo "master                master-client of underlay mocker, for slave deploying and config distributing"
+    echo "slave                 slave-client of underlay mocker, for concrete setting"
+    echo " "
+    echo "How to use $PACKAGE to mock an underlay network on VPC:"
+    echo "1. copy \"underlayctl\" and your underlay network config to one of your VPC nodes"
+    echo "2. use tool \"ssh-no-password\" to generate ssh key"
+    echo "3. use tool \"master\" to specify underlay network config. It will finish rest jobs."
+}
+
+if [ $# == 0 ]; then
+    help
+    exit 0
+fi
+
+while test $# -gt 0; do
+  case "$1" in
+    ssh-no-password)
+      shift
+      ssh-no-password "$@"
+      ;;
+    master)
+      shift
+      master "$@"
+      ;;
+    slave)
+      shift
+      slave "$@"
+      ;;
+    *)
+      shift
+      help
+      ;;
+  esac
+done
+

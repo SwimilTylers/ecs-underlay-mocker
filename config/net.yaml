@@ -1,0 +1,13 @@
+dev: eth1
+parent: eth0
+vnid: 100
+port: 4096
+cidr: 192.168.56.0/24
+nodes:
+    - node: 172.19.18.232
+      ip: 192.168.56.1
+      gateway: true
+    - node: 172.19.18.228
+    - node: 172.19.18.229
+    - node: 172.19.18.230
+    - node: 172.19.18.231
