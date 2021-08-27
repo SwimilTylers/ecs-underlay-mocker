@@ -153,13 +153,13 @@ function ConfigSingleNetwork() {
     echo "$CONFIG configured!"
 }
 
-function ssh-no-password() {
+function ssh-auth() {
     while test $# -gt 0; do
       case "$1" in
           -h|--help)
-          echo "$PACKAGE-ssh-no-password - ssh without type password each time"
+          echo "$PACKAGE-ssh-auth - ssh without type password each time"
           echo " "
-          echo "$PACKAGE ssh-no-password [options] [nodes]"
+          echo "$PACKAGE ssh-auth [options] [nodes]"
           echo " "
           echo "options:"
           echo "-h, --help                show brief help"
@@ -325,13 +325,13 @@ function help() {
     echo "$PACKAGE tool [-h|--help] [options] [other arguments]"
     echo " "
     echo "tools:"
-    echo "ssh-no-password       allow master connecting to slave without password"
+    echo "ssh-auth              authenticate ssh connection towards those nodes"
     echo "master                master-client of underlay mocker, for slave deploying and config distributing"
     echo "slave                 slave-client of underlay mocker, for concrete setting"
     echo " "
     echo "How to use $PACKAGE to mock an underlay network on VPC:"
     echo "1. copy \"underlayctl\" and your underlay network config to one of your VPC nodes"
-    echo "2. use tool \"ssh-no-password\" to generate ssh key"
+    echo "2. use tool \"ssh-auth\" to generate ssh key"
     echo "3. use tool \"master\" to specify underlay network config. It will finish rest jobs."
 }
 
@@ -342,9 +342,9 @@ fi
 
 while test $# -gt 0; do
   case "$1" in
-    ssh-no-password)
+    ssh-auth)
       shift
-      ssh-no-password "$@"
+      ssh-auth "$@"
       ;;
     master)
       shift

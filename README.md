@@ -6,12 +6,12 @@ Mocking a L2-underlay network over ECS L3-VPC.
 underlayctl tool [-h|--help] [options] [other arguments]
  
 tools:
-ssh-no-password       allow master connecting to slave without password
-master                master-client of underlay mocker, for slave deploying and config distributing
-slave                 slave-client of underlay mocker, for concrete setting
+ssh-auth     authenticate ssh connection towards those nodes
+master       master-client of underlay mocker, for slave deploying and config distributing
+slave        slave-client of underlay mocker, for concrete setting
 ```
 
-The mocking process requires `ssh` and `scp` operations. `ssh-no-password` relates to 
+The mocking process requires `ssh` and `scp` operations. `ssh-auth` relates to 
 ssh authentication, relieving you from tedious typing of passwords.
 
 The `master` loads config and deploys `slave` across nodes automatically. 
@@ -37,7 +37,7 @@ We offer a sample yaml `config/net.yaml`.
 ## How to apply an underlay config
 
 1. copy `underlayctl` and your underlay network config to one of your VPC nodes
-2. use tool `ssh-no-password` to generate ssh authentication.
+2. use tool `ssh-auth` to generate ssh authentication.
 3. use tool `master` to specify underlay network config. It will finish rest jobs.
    If you want to use the sample config, try this: `./underlayctl master --check-config config/net.yaml`.
 
