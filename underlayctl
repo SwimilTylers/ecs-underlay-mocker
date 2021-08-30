@@ -11,16 +11,23 @@ BROADCAST_MAC='00:00:00:00:00:00'
 ROUTER_ARP_PROXY=0
 CHECK_CONFIG=0
 EXECUTE_AFTER_DEPLOY=1
+RET_VAL=0
 
 function SetUpVxLAN() {
     PARENT_DEV=$1
     VXLAN_DEV=$2
     VNID=$3
     UDP_PORT=$4
+    RET_VAL=0
 
-    if [ "$(ifconfig | grep -q "$VXLAN_DEV")" != '0' ]; then
+    LINK_CFG='link.cfg'
+    ip link > $LINK_CFG
+
+    if grep -q "$VXLAN_DEV" "$LINK_CFG"; then
         if [ $FORCE_SETUP_IF_EXISTS -eq 0 ]; then
-            return 1
+            rm -f $LINK_CFG
+            RET_VAL=1
+            return 0
         fi
         sudo ip link del "$VXLAN_DEV"
     fi
@@ -28,16 +35,41 @@ function SetUpVxLAN() {
     sudo ip link add link "$PARENT_DEV" name "$VXLAN_DEV" type vxlan id "$VNID" dstport "$UDP_PORT" learning
     sudo ip link set "$VXLAN_DEV" up
 
-    return 0
+    rm -f $LINK_CFG
+}
+
+function AssignIP() {
+    VXLAN_DEV=$1
+    IP=$2
+    RET_VAL=0
+
+    ADDR_CFG='addr.cfg'
+    ip addr show dev "$VXLAN_DEV" > $ADDR_CFG
+
+    if grep -q "$IP" "$ADDR_CFG"; then
+        RET_VAL=1
+    else
+        sudo ip addr add "$IP" dev "$VXLAN_DEV"
+    fi
+
+    rm -f $ADDR_CFG
 }
 
 function AppendNewFDBEntry() {
     VXLAN_DEV=$1
     REMOTE_IP=$2
+    RET_VAL=0
 
-    if [ "$(bridge fdb show | grep -q "dev $VXLAN_DEV dst $REMOTE_IP")" != '0' ]; then
+    FDB_CFG='fdb.cfg'
+    bridge fdb show > $FDB_CFG
+
+    if grep -q "dev $VXLAN_DEV dst $REMOTE_IP" "$FDB_CFG"; then
+        RET_VAL=1
+    else
         bridge fdb append "$BROADCAST_MAC" dev "$VXLAN_DEV" dst "$REMOTE_IP" self permanent
     fi
+
+    rm -f $FDB_CFG
 }
 
 function WorkAsGateway() {
@@ -118,13 +150,20 @@ function ConfigSingleNetwork() {
         fi
     fi
 
+    SLAVE_CLIENT=underlayctl-slave
+    cp underlayctl $SLAVE_CLIENT
+    SLAVE_SET=""
+
     for (( i = 0; i < ${#NODES[@]}; i++ )); do
         NODE=${NODES[$i]}
-        scp underlayctl root@"$NODE":.
-        echo "deploy client to $NODE"
+        SLAVE_SET="$SLAVE_SET $NODE"
+        scp $SLAVE_CLIENT root@"$NODE":. > /dev/null
     done
 
+    echo "all slave client sent!"
+
     if [ $EXECUTE_AFTER_DEPLOY -ne 1 ]; then
+        echo "quit execute slave"
         return 0
     fi
 
@@ -146,8 +185,11 @@ function ConfigSingleNetwork() {
             SLAVE_ARGS="$SLAVE_ARGS --as-gateway=$CIDR"
         fi
 
+        SLAVE_ARGS="$SLAVE_ARGS $SLAVE_SET"
+
+        echo "[$i] calling slave on $NODE:"
         # shellcheck disable=SC2029
-        ssh root@"$NODE" "./underlayctl slave $SLAVE_ARGS"
+        ssh root@"$NODE" "./$SLAVE_CLIENT slave $SLAVE_ARGS"
     done
 
     echo "$CONFIG configured!"
@@ -233,6 +275,7 @@ function slave() {
     PORT=""
     UNDERLAY_IP=""
     AS_GATEWAY=""
+    USE_GATEWAY=""
 
     while test $# -gt 0; do
       case "$1" in
@@ -249,6 +292,7 @@ function slave() {
           echo "--net-id=ID                  specify the vnid for vxlan tunnel for underlay traffic"
           echo "--udp-port=PORT              specify the udp port of vxlan tunnel for underlay traffic"
           echo "--as-gateway=CIDR            work as a gateway for the underlay network"
+          echo "--use-gateway=IP             use IP as a gateway for the underlay network"
           echo "--force                      force to set up an underlay device even if it already exists"
           exit 0
           ;;
@@ -272,8 +316,12 @@ function slave() {
           PORT=`echo $1 | sed -e 's/^[^=]*=//g'`
           shift
           ;;
-        --as-gateway)
+        --as-gateway*)
           AS_GATEWAY=`echo $1 | sed -e 's/^[^=]*=//g'`
+          shift
+          ;;
+        --use-gateway*)
+          USE_GATEWAY=`echo $1 | sed -e 's/^[^=]*=//g'`
           shift
           ;;
         --force)
@@ -286,18 +334,21 @@ function slave() {
       esac
     done
 
-    SetUpVxLAN "$VXLAN_DEV" "$PARENT_DEV" "$VNID" "$PORT"
-    retVal=$?
+    SetUpVxLAN "$PARENT_DEV" "$VXLAN_DEV" "$VNID" "$PORT"
 
-    if [ $retVal -ne 0 ]; then
-        echo "[1] $VXLAN_DEV already exists, skip this step."
+    if [ $RET_VAL -ne 0 ]; then
+        echo "  [1] $VXLAN_DEV already exists, skip this step."
     else
-        echo "[1] $VXLAN_DEV installed!"
+        echo "  [1] $VXLAN_DEV installed!"
     fi
 
     if [ -n "$UNDERLAY_IP" ]; then
-        sudo ip addr add "$UNDERLAY_IP" dev "$VXLAN_DEV"
-        echo "[1] Assign $UNDERLAY_IP to $VXLAN_DEV"
+        AssignIP "$VXLAN_DEV" "$UNDERLAY_IP"
+        if [ $RET_VAL -ne 0 ]; then
+            echo "  [1] $UNDERLAY_IP already assigned to $VXLAN_DEV, skip this step."
+        else
+            echo "  [1] Assign $UNDERLAY_IP to $VXLAN_DEV!"
+        fi
     fi
 
     while test $# -gt 0; do
@@ -305,17 +356,17 @@ function slave() {
       shift
     done
 
-    echo "[2] fdb on dev $VXLAN_DEV configured!"
+    echo "  [2] fdb on dev $VXLAN_DEV configured!"
 
     if [ -n "$AS_GATEWAY" ]; then
       if [ -z "$UNDERLAY_IP" ]; then
-          echo "[3] failed to work as gateway: no underlay ip assigned"
+          echo "  [3] failed to work as gateway: no underlay ip assigned"
           exit 1
       fi
       WorkAsGateway "$VXLAN_DEV" "$UNDERLAY_IP" "$AS_GATEWAY"
-      echo "[3] work as gateway node: done"
+      echo "  [3] work as gateway node: done"
     else
-      echo "[3] work as normal node: done"
+      echo "  [3] work as normal node: done"
     fi
 }
 
@@ -340,24 +391,22 @@ if [ $# == 0 ]; then
     exit 0
 fi
 
-while test $# -gt 0; do
-  case "$1" in
-    ssh-auth)
-      shift
-      ssh-auth "$@"
-      ;;
-    master)
-      shift
-      master "$@"
-      ;;
-    slave)
-      shift
-      slave "$@"
-      ;;
-    *)
-      shift
-      help
-      ;;
-  esac
-done
+case "$1" in
+  ssh-auth)
+    shift
+    ssh-auth "$@"
+    ;;
+  master)
+    shift
+    master "$@"
+    ;;
+  slave)
+    shift
+    slave "$@"
+    ;;
+  *)
+    echo "cannot recognize tool: $1"
+    help
+    ;;
+esac
 
