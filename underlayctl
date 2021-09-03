@@ -8,7 +8,6 @@ PACKAGE='underlayctl'
 
 FORCE_SETUP_IF_EXISTS=0
 BROADCAST_MAC='00:00:00:00:00:00'
-ROUTER_ARP_PROXY=0
 CHECK_CONFIG=0
 EXECUTE_AFTER_DEPLOY=1
 RET_VAL=0
@@ -36,6 +35,10 @@ function SetUpVxLAN() {
     sudo ip link set "$VXLAN_DEV" up
 
     rm -f $LINK_CFG
+}
+
+function EnableForwarding() {
+    sudo iptables -P FORWARD ACCEPT
 }
 
 function AssignIP() {
@@ -72,26 +75,108 @@ function AppendNewFDBEntry() {
     rm -f $FDB_CFG
 }
 
-function WorkAsGateway() {
-    VXLAN_DEV=$1
-    UNDERLAY_IP=$2
-    UNDERLAY_CIDR=$3
+REQUEST_VXLAN_DEV=''
+REQUEST_PARENT_DEV=''
+REQUEST_VNID=''
+REQUEST_CIDR=''
+REQUEST_PORT=''
+REQUEST_NODES=()
+REQUEST_IPS=()
+REQUEST_GATEWAY_NODE=''
 
-    sudo ip route replace "$UNDERLAY_CIDR" dev "$VXLAN_DEV" proto kernel scope link src "$UNDERLAY_IP"
+function ReadParamFromFlags() {
+    REQUEST_VXLAN_DEV='eth1'
+    REQUEST_PARENT_DEV='eth0'
+    REQUEST_VNID=100
+    REQUEST_PORT=4096
+
+    while test $# -gt 0; do
+      case "$1" in
+          -h|--help)
+            echo "$PACKAGE-master-auto - auto-configured master client for underlay mocker using vxlan tunnel"
+            echo " "
+            echo "$PACKAGE master auto [parameters] [nodes]"
+            echo " "
+            echo "parameters:"
+            echo "-h, --help                   show brief help"
+            echo "--cidr=CIDR                  specify the cidr of the underlay network, omit if empty"
+            echo "--underlay-dev=DEV_NAME      designate a name for the device on underlay network, default as $REQUEST_VXLAN_DEV"
+            echo "--parent-dev=DEV_NAME        specify the parent device from which underlay device is derived, default as $REQUEST_PARENT_DEV"
+            echo "--net-id=ID                  specify the vnid for vxlan tunnel for underlay traffic, default as $REQUEST_VNID"
+            echo "--udp-port=PORT              specify the udp port of vxlan tunnel for underlay traffic, default as $REQUEST_PORT"
+            exit 0
+            ;;
+          --cidr*)
+            REQUEST_CIDR=`echo $1 | sed -e 's/^[^=]*=//g'`
+            shift
+            ;;
+          --underlay-dev*)
+            REQUEST_VXLAN_DEV=`echo $1 | sed -e 's/^[^=]*=//g'`
+            shift
+            ;;
+          --parent-dev*)
+            REQUEST_PARENT_DEV=`echo $1 | sed -e 's/^[^=]*=//g'`
+            shift
+            ;;
+          --net-id*)
+            REQUEST_VNID=`echo $1 | sed -e 's/^[^=]*=//g'`
+            shift
+            ;;
+          --udp-port*)
+            REQUEST_PORT=`echo $1 | sed -e 's/^[^=]*=//g'`
+            shift
+            ;;
+          *)
+            break
+            ;;
+      esac
+    done
+
+    REQUEST_NODES=()
+
+    while test $# -gt 0; do
+        REQUEST_NODES+=("$1")
+        shift
+    done
+
+    if [ -z "$REQUEST_CIDR" ]; then
+        echo "no cidr found, stop underlay ip auto assignment"
+        return 0
+    fi
+
+    NET=$(echo "$REQUEST_CIDR" | awk '{split($0,a,"/"); print a[1]}')
+    RANGE=$(echo "$REQUEST_CIDR" | awk '{split($0,a,"/"); print a[2]}')
+
+    if [ -z "$RANGE" ]; then
+        RANGE=24
+    fi
+
+    if [[ $RANGE -gt 24 ]]; then
+        echo "currently not support cidr $REQUEST_CIDR"
+        return 1
+    fi
+
+    for (( i = 0; i < ${#REQUEST_NODES[@]}; i++ )); do
+        NODE=${REQUEST_NODES[$i]}
+        IP="$(echo "$NET" | awk '{split($0,a,"\."); print a[1]}').$(echo "$NET" | awk '{split($0,a,"\."); print a[2]}').$(echo "$NET" | awk '{split($0,a,"\."); print a[3]}')"
+        HOST=$((i+1))
+        IP="$IP.$HOST/$RANGE"
+        REQUEST_IPS[$i]=$IP
+    done
 }
 
-function ConfigSingleNetwork() {
+function ExtractParamFromYaml() {
     CONFIG=$1
 
-    VXLAN_DEV=$(grep "dev" "$CONFIG" 2>/dev/null | awk '{print $2}')
-    PARENT_DEV=$(grep "parent" "$CONFIG" 2>/dev/null | awk '{print $2}')
-    VNID=$(grep "vnid" "$CONFIG" 2>/dev/null | awk '{print $2}')
-    CIDR=$(grep "cidr" "$CONFIG" 2>/dev/null | awk '{print $2}')
-    PORT=$(grep "port" "$CONFIG" 2>/dev/null | awk '{print $2}')
+    REQUEST_VXLAN_DEV=$(grep "dev" "$CONFIG" 2>/dev/null | awk '{print $2}')
+    REQUEST_PARENT_DEV=$(grep "parent" "$CONFIG" 2>/dev/null | awk '{print $2}')
+    REQUEST_VNID=$(grep "vnid" "$CONFIG" 2>/dev/null | awk '{print $2}')
+    REQUEST_CIDR=$(grep "cidr" "$CONFIG" 2>/dev/null | awk '{print $2}')
+    REQUEST_PORT=$(grep "port" "$CONFIG" 2>/dev/null | awk '{print $2}')
 
-    NODES=()
-    IPS=()
-    GATEWAY_NODE=""
+    REQUEST_NODES=()
+    REQUEST_IPS=()
+    REQUEST_GATEWAY_NODE=""
 
     NODES_START_FROM=$(awk '/nodes:/{print NR}' "$CONFIG")
     NODES_CFG="$(awk "NR>$NODES_START_FROM" "$CONFIG")"
@@ -115,35 +200,37 @@ function ConfigSingleNetwork() {
 
         case $key in
         node)
-          NODES[$idx]=$val
+          REQUEST_NODES[$idx]=$val
           ;;
         ip)
-          IPS[$idx]=$val
+          REQUEST_IPS[$idx]=$val
           ;;
         gateway)
           if [ "$val" == "true" ]; then
-              GATEWAY_NODE=$idx
+              REQUEST_GATEWAY_NODE=$idx
           fi
           ;;
         esac
     done <<< "$NODES_CFG"
 
-    GATEWAY_NODE=${NODES[$GATEWAY_NODE]}
+    #REQUEST_GATEWAY_NODE=${REQUEST_NODES[$REQUEST_GATEWAY_NODE]}
+}
 
+function ConfigRequestNetwork() {
     if [ $CHECK_CONFIG -ne 0 ]; then
-        echo "Load from '$CONFIG':"
-        echo "[$CIDR] [dev=$VXLAN_DEV, parent=$PARENT_DEV, vnid=$VNID, port=$PORT]"
-        for (( i = 0; i < ${#NODES[@]}; i++ )); do
-            NODE=${NODES[$i]}
-            IP=${IPS[$i]}
+        echo "[$REQUEST_CIDR] [dev=$REQUEST_VXLAN_DEV, parent=$REQUEST_PARENT_DEV, vnid=$REQUEST_VNID, port=$REQUEST_PORT]"
+        for (( i = 0; i < ${#REQUEST_NODES[@]}; i++ )); do
+            NODE=${REQUEST_NODES[$i]}
+            IP=${REQUEST_IPS[$i]}
             IS_GATEWAY='no'
-            if [ "$NODE" == "$GATEWAY_NODE" ]; then
+            if [ "$NODE" == "$REQUEST_GATEWAY_NODE" ]; then
                 IS_GATEWAY='yes'
             fi
             echo "[$i] [node=$NODE, ip=$IP, is-gateway=$IS_GATEWAY]"
         done
 
-        read -r -p "Proceed[y/n]: " proceed
+        read -r -n1 -p "Proceed[y/n]: " proceed
+        echo ""
         if [ "$proceed" != "y" ]; then
             echo "quit this underlay network config"
             return 1
@@ -154,8 +241,8 @@ function ConfigSingleNetwork() {
     cp underlayctl $SLAVE_CLIENT
     SLAVE_SET=""
 
-    for (( i = 0; i < ${#NODES[@]}; i++ )); do
-        NODE=${NODES[$i]}
+    for (( i = 0; i < ${#REQUEST_NODES[@]}; i++ )); do
+        NODE=${REQUEST_NODES[$i]}
         SLAVE_SET="$SLAVE_SET $NODE"
         scp $SLAVE_CLIENT root@"$NODE":. > /dev/null
     done
@@ -167,23 +254,23 @@ function ConfigSingleNetwork() {
         return 0
     fi
 
-    for (( i = 0; i < ${#NODES[@]}; i++ )); do
-        SLAVE_ARGS="--underlay-dev=$VXLAN_DEV --parent-dev=$PARENT_DEV --net-id=$VNID --udp-port=$PORT"
+    for (( i = 0; i < ${#REQUEST_NODES[@]}; i++ )); do
+        SLAVE_ARGS="--underlay-dev=$REQUEST_VXLAN_DEV --parent-dev=$REQUEST_PARENT_DEV --net-id=$REQUEST_VNID --udp-port=$REQUEST_PORT"
 
         if [ $FORCE_SETUP_IF_EXISTS -ne 0 ]; then
             SLAVE_ARGS="$SLAVE_ARGS --force"
         fi
 
-        NODE=${NODES[$i]}
-        IP=${IPS[$i]}
+        NODE=${REQUEST_NODES[$i]}
+        IP=${REQUEST_IPS[$i]}
 
         if [ -n "$IP" ]; then
             SLAVE_ARGS="$SLAVE_ARGS --local-underlay-ip=$IP"
         fi
 
-        if [ "$NODE" == "$GATEWAY_NODE" ]; then
-            SLAVE_ARGS="$SLAVE_ARGS --as-gateway=$CIDR"
-        fi
+        #if [ "$NODE" == "$REQUEST_GATEWAY_NODE" ]; then
+        #    SLAVE_ARGS="$SLAVE_ARGS --as-gateway=$CIDR"
+        #fi
 
         SLAVE_ARGS="$SLAVE_ARGS $SLAVE_SET"
 
@@ -191,8 +278,6 @@ function ConfigSingleNetwork() {
         # shellcheck disable=SC2029
         ssh root@"$NODE" "./$SLAVE_CLIENT slave $SLAVE_ARGS"
     done
-
-    echo "$CONFIG configured!"
 }
 
 function ssh-auth() {
@@ -229,7 +314,8 @@ function master() {
           -h|--help)
           echo "$PACKAGE-master - master client for underlay mocker using vxlan tunnel"
           echo " "
-          echo "$PACKAGE master [options] [files]"
+          echo "$PACKAGE master [options] using [files]"
+          echo "$PACKAGE master [options] auto [parameters] [nodes]"
           echo " "
           echo "options:"
           echo "-h, --help                   show brief help"
@@ -256,16 +342,33 @@ function master() {
       esac
     done
 
-    while test $# -gt 0; do
-      CONFIG=$1
-      if [ ! -f "$CONFIG" ]; then
-          echo "file not exists: $CONFIG"
-          exit 1
-      fi
+    LOAD_STYLE=$1
+    shift
 
-      ConfigSingleNetwork "$CONFIG"
-      shift
-    done
+    case $LOAD_STYLE in
+    using)
+      while test $# -gt 0; do
+          CONFIG=$1
+          if [ ! -f "$CONFIG" ]; then
+              echo "file not exists: $CONFIG"
+              exit 1
+          fi
+          ExtractParamFromYaml "$CONFIG"
+          ConfigRequestNetwork
+          echo "$CONFIG configured!"
+          shift
+      done
+      ;;
+    auto)
+      ReadParamFromFlags "$@"
+      ConfigRequestNetwork
+      echo "auto underlay network configured!"
+      ;;
+    *)
+      echo "unknown operation"
+      exit 1
+      ;;
+    esac
 }
 
 function slave() {
@@ -275,7 +378,6 @@ function slave() {
     PORT=""
     UNDERLAY_IP=""
     AS_GATEWAY=""
-    USE_GATEWAY=""
 
     while test $# -gt 0; do
       case "$1" in
@@ -291,8 +393,6 @@ function slave() {
           echo "--parent-dev=DEV_NAME        specify the parent device from which underlay device is derived"
           echo "--net-id=ID                  specify the vnid for vxlan tunnel for underlay traffic"
           echo "--udp-port=PORT              specify the udp port of vxlan tunnel for underlay traffic"
-          echo "--as-gateway=CIDR            work as a gateway for the underlay network"
-          echo "--use-gateway=IP             use IP as a gateway for the underlay network"
           echo "--force                      force to set up an underlay device even if it already exists"
           exit 0
           ;;
@@ -316,14 +416,6 @@ function slave() {
           PORT=`echo $1 | sed -e 's/^[^=]*=//g'`
           shift
           ;;
-        --as-gateway*)
-          AS_GATEWAY=`echo $1 | sed -e 's/^[^=]*=//g'`
-          shift
-          ;;
-        --use-gateway*)
-          USE_GATEWAY=`echo $1 | sed -e 's/^[^=]*=//g'`
-          shift
-          ;;
         --force)
           FORCE_SETUP_IF_EXISTS=1
           shift
@@ -335,6 +427,7 @@ function slave() {
     done
 
     SetUpVxLAN "$PARENT_DEV" "$VXLAN_DEV" "$VNID" "$PORT"
+    EnableForwarding
 
     if [ $RET_VAL -ne 0 ]; then
         echo "  [1] $VXLAN_DEV already exists, skip this step."
@@ -363,7 +456,6 @@ function slave() {
           echo "  [3] failed to work as gateway: no underlay ip assigned"
           exit 1
       fi
-      WorkAsGateway "$VXLAN_DEV" "$UNDERLAY_IP" "$AS_GATEWAY"
       echo "  [3] work as gateway node: done"
     else
       echo "  [3] work as normal node: done"
