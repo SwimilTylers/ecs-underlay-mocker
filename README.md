@@ -9,6 +9,7 @@ tools:
 ssh-auth     authenticate ssh connection towards those nodes
 master       master-client of underlay mocker, for slave deploying and config distributing
 slave        slave-client of underlay mocker, for concrete setting
+lite         lightweight client of underlay mocker without slave deploying
 ```
 
 The mocking process requires `ssh` and `scp` operations. `ssh-auth` relates to 
@@ -18,22 +19,45 @@ The `master` loads config and deploys `slave` across nodes automatically.
 In normal case, you ONLY have to care about `master` tool and underlay network config. 
 Direct use of `slave` tool is NOT preferable, unless some error occurs.
 
+The `lite` is a lightweight client for underlay mocker and all configuration relies on
+`ssh` remote calls without `scp` delivery of slave clients. You can use it as a quick start.
+
 ## Configure a simple underlay network
+
+1. copy `underlayctl` to one of your VPC nodes
+2. (if necessary) use tool `ssh-auth` to grant ssh authentication.
+3. use tool `lite` and specify VPC nodes. It will generate underlay network config 
+   automatically and finish the rest jobs.
 
 If you want to set up an underlay network among these vpc nodes
 `172.19.18.228/30, 172.19.18.229/30, 172.19.18.230/30`,  try this cmd
 ```shell
-./underlayctl master auto 172.19.18.228 172.19.18.229 172.19.18.230
+./underlayctl lite 172.19.18.228 172.19.18.229 172.19.18.230
 ```
 If you want to assign underlay ip to those nodes automatically, please specify 
 CIDR of the underlay network.
 ```shell
-./underlayctl master auto --cidr=192.168.56.0/24 172.19.18.228 172.19.18.229 172.19.18.230
+./underlayctl lite --cidr=192.168.56.0/24 172.19.18.228 172.19.18.229 172.19.18.230
 ```
 Therefore, we get config on each node (vpc iface default as `eth0`, underlay iface default as `eth1`):
 - `eth0=172.19.18.228/30, eth1=192.168.56.1/24`
 - `eth0=172.19.18.229/30, eth1=192.168.56.2/24`
 - `eth0=172.19.18.230/30, eth1=192.168.56.3/24`
+
+If you want to specify other parameters, seek `./underlayctl lite -h` for details.
+
+Tool `lite` is a lightweight client for underlay mocker and all configuration without `scp` delivery 
+of slave clients. However, it provides no config checking and might cause some trouble in some 
+scenarios, e.g., redoing or updating.
+
+If you want full functionality of config checking when setting up a simple network, try 
+use `master-auto` tool. The usage is similar:
+```shell
+# without ip allocation
+./underlayctl master auto 172.19.18.228 172.19.18.229 172.19.18.230
+# with ip allocation
+./underlayctl master auto --cidr=192.168.56.0/24 172.19.18.228 172.19.18.229 172.19.18.230
+```
 
 ## Configure a more complicated network
 
@@ -56,9 +80,10 @@ We offer a sample yaml `config/net.yaml`.
 ### How to apply an underlay config
 
 1. copy `underlayctl` and your underlay network config to one of your VPC nodes
-2. use tool `ssh-auth` to generate ssh authentication.
+2. (if necessary) use tool `ssh-auth` to generate ssh authentication.
 3. use tool `master` to specify underlay network config. It will finish rest jobs.
-   If you want to use the sample config, try this: `./underlayctl master --check-config using config/net.yaml`.
+   
+If you want to use the sample config, try this: `./underlayctl master --check-config using config/net.yaml`.
 
 
 ### How to update an underlay config

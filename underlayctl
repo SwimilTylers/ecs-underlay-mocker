@@ -4,7 +4,7 @@ set -o errexit
 set -o errtrace
 set -o pipefail
 
-PACKAGE='underlayctl'
+PACKAGE=$(basename "${BASH_SOURCE[0]}")
 
 FORCE_SETUP_IF_EXISTS=0
 BROADCAST_MAC='00:00:00:00:00:00'
@@ -12,6 +12,11 @@ CHECK_CONFIG=0
 EXECUTE_AFTER_DEPLOY=1
 RET_VAL=0
 
+# RET_VAL:
+# - 0: installed
+# - 1: skip
+# - 2: vnid occupied
+# - 3: dev config out-of-date
 function SetUpVxLAN() {
     PARENT_DEV=$1
     VXLAN_DEV=$2
@@ -19,22 +24,85 @@ function SetUpVxLAN() {
     UDP_PORT=$4
     RET_VAL=0
 
-    LINK_CFG='link.cfg'
-    ip link > $LINK_CFG
+    LINK_CHECK=$(ip link)
 
-    if grep -q "$VXLAN_DEV" "$LINK_CFG"; then
+    if [ -z "${LINK_CHECK##*$VXLAN_DEV:*}" ]; then
         if [ $FORCE_SETUP_IF_EXISTS -eq 0 ]; then
-            rm -f $LINK_CFG
+            LINK_CHECK=$(ip -d link show type vxlan)
+
+            # check if $VXLAN_DEV is a vxlan device
+            if [ -n "${LINK_CHECK##*$VXLAN_DEV:*}" ]; then
+                RET_VAL=3
+                # echo "dev type changed"
+                return 0
+            fi
+
+            LINK_CHECK=$(ip -d link show dev "$VXLAN_DEV" | grep vxlan)
+
+            # check if vnid of $VXLAN_DEV has changed
+            VNID_CHECK="id $VNID"
+
+            if [ -n "${LINK_CHECK##*$VNID_CHECK*}" ]; then
+                RET_VAL=3
+                # echo "vnid changed"
+                return 0
+            fi
+
+            # check if udp port of $VXLAN_DEV has changed
+            PORT_CHECK="dstport $UDP_PORT"
+
+            if [ -n "${LINK_CHECK##*$PORT_CHECK*}" ]; then
+                RET_VAL=3
+                # echo "port changed"
+                return 0
+            fi
+
+            # pass all check, skip it
             RET_VAL=1
             return 0
         fi
         sudo ip link del "$VXLAN_DEV"
     fi
 
+    LINK_CHECK=$(ip -d link show type vxlan)
+
+    if [ -n "$LINK_CHECK" ]; then
+        OTHER_VXLAN_CFG=$(echo "$LINK_CHECK" | grep vxlan)
+
+        VNID_CHECK="id $VNID"
+
+        if [ -z "${OTHER_VXLAN_CFG##*$VNID_CHECK*}" ]; then
+            RET_VAL=2
+            return 0
+        fi
+    fi
+
+    #LINK_CFG='link.cfg'
+    #ip link > $LINK_CFG
+
+    #if grep -q "$VXLAN_DEV" "$LINK_CFG"; then
+    #    if [ $FORCE_SETUP_IF_EXISTS -eq 0 ]; then
+    #        rm -f $LINK_CFG
+    #        RET_VAL=1
+    #        return 0
+    #    fi
+    #    sudo ip link del "$VXLAN_DEV"
+    #fi
+
     sudo ip link add link "$PARENT_DEV" name "$VXLAN_DEV" type vxlan id "$VNID" dstport "$UDP_PORT" learning
     sudo ip link set "$VXLAN_DEV" up
 
-    rm -f $LINK_CFG
+    #rm -f $LINK_CFG
+}
+
+function DelVxLan() {
+    VXLAN_DEV=$1
+
+    LINK_CHECK=$(ip link)
+
+    if [ -z "${LINK_CHECK##*$VXLAN_DEV:*}" ]; then
+        sudo ip link del "$VXLAN_DEV"
+    fi
 }
 
 function EnableForwarding() {
@@ -46,16 +114,24 @@ function AssignIP() {
     IP=$2
     RET_VAL=0
 
-    ADDR_CFG='addr.cfg'
-    ip addr show dev "$VXLAN_DEV" > $ADDR_CFG
+    #ADDR_CFG='addr.cfg'
+    #ip addr show dev "$VXLAN_DEV" > $ADDR_CFG
 
-    if grep -q "$IP" "$ADDR_CFG"; then
+    ADDR_CHECK=$(ip addr show dev "$VXLAN_DEV")
+
+    if [ -z "${ADDR_CHECK##*$IP*}" ]; then
         RET_VAL=1
     else
         sudo ip addr add "$IP" dev "$VXLAN_DEV"
     fi
 
-    rm -f $ADDR_CFG
+    #if grep -q "$IP" "$ADDR_CFG"; then
+    #    RET_VAL=1
+    #else
+    #    sudo ip addr add "$IP" dev "$VXLAN_DEV"
+    #fi
+
+    #rm -f $ADDR_CFG
 }
 
 function AppendNewFDBEntry() {
@@ -63,16 +139,44 @@ function AppendNewFDBEntry() {
     REMOTE_IP=$2
     RET_VAL=0
 
-    FDB_CFG='fdb.cfg'
-    bridge fdb show > $FDB_CFG
+    #FDB_CFG='fdb.cfg'
+    #bridge fdb show > $FDB_CFG
 
-    if grep -q "dev $VXLAN_DEV dst $REMOTE_IP" "$FDB_CFG"; then
+    FDB_CHECK=$(bridge fdb show)
+    TOKEN="dev $VXLAN_DEV dst $REMOTE_IP"
+
+    if [ -z "${FDB_CHECK##*$TOKEN*}" ]; then
         RET_VAL=1
     else
-        bridge fdb append "$BROADCAST_MAC" dev "$VXLAN_DEV" dst "$REMOTE_IP" self permanent
+        sudo bridge fdb append "$BROADCAST_MAC" dev "$VXLAN_DEV" dst "$REMOTE_IP" self permanent
     fi
 
-    rm -f $FDB_CFG
+    #if grep -q "dev $VXLAN_DEV dst $REMOTE_IP" "$FDB_CFG"; then
+    #    RET_VAL=1
+    #else
+    #    bridge fdb append "$BROADCAST_MAC" dev "$VXLAN_DEV" dst "$REMOTE_IP" self permanent
+    #fi
+
+    #rm -f $FDB_CFG
+}
+
+function RouteCidr() {
+    DEV=$1
+    XCIDR=$2
+    VIA_IP=$3
+    RET_VAL=0
+
+    ROUTE_CHECK=$(ip route show dev "$DEV")
+
+    if [ -z "${ROUTE_CHECK##*$XCIDR*}" ]; then
+        RET_VAL=1
+    else
+        if [ -z "$VIA_IP" ]; then
+            sudo ip route add "$XCIDR" dev "$DEV"
+        else
+            sudo ip route add "$XCIDR" dev "$DEV" via "$VIA_IP" onlink
+        fi
+    fi
 }
 
 REQUEST_VXLAN_DEV=''
@@ -93,10 +197,6 @@ function ReadParamFromFlags() {
     while test $# -gt 0; do
       case "$1" in
           -h|--help)
-            echo "$PACKAGE-master-auto - auto-configured master client for underlay mocker using vxlan tunnel"
-            echo " "
-            echo "$PACKAGE master auto [parameters] [nodes]"
-            echo " "
             echo "parameters:"
             echo "-h, --help                   show brief help"
             echo "--cidr=CIDR                  specify the cidr of the underlay network, omit if empty"
@@ -158,7 +258,7 @@ function ReadParamFromFlags() {
 
     for (( i = 0; i < ${#REQUEST_NODES[@]}; i++ )); do
         NODE=${REQUEST_NODES[$i]}
-        IP="$(echo "$NET" | awk '{split($0,a,"\."); print a[1]}').$(echo "$NET" | awk '{split($0,a,"\."); print a[2]}').$(echo "$NET" | awk '{split($0,a,"\."); print a[3]}')"
+        IP="$(echo "$NET" | awk '{split($0,a,"\."); print a[1]}' 2>/dev/null).$(echo "$NET" | awk '{split($0,a,"\."); print a[2]}' 2>/dev/null).$(echo "$NET" | awk '{split($0,a,"\."); print a[3]}' 2>/dev/null)"
         HOST=$((i+1))
         IP="$IP.$HOST/$RANGE"
         REQUEST_IPS[$i]=$IP
@@ -224,6 +324,30 @@ function ExtractParamFromYaml() {
     #REQUEST_GATEWAY_NODE=${REQUEST_NODES[$REQUEST_GATEWAY_NODE]}
 }
 
+function LiteConfigRequestNetwork() {
+    SETUP="sudo ip link add link $REQUEST_PARENT_DEV name $REQUEST_VXLAN_DEV type vxlan id $REQUEST_VNID dstport $REQUEST_PORT learning && sudo ip link set $REQUEST_VXLAN_DEV up && sudo iptables -P FORWARD ACCEPT"
+    FDB=''
+    for (( i = 0; i < ${#REQUEST_NODES[@]}; i++ )); do
+        NODE=${REQUEST_NODES[$i]}
+        FDB="$FDB && sudo bridge fdb append $BROADCAST_MAC dev $REQUEST_VXLAN_DEV dst $NODE self permanent"
+    done
+
+    for (( i = 0; i < ${#REQUEST_NODES[@]}; i++ )); do
+        NODE=${REQUEST_NODES[$i]}
+        IP=${REQUEST_IPS[$i]}
+
+        echo "[$i] calling slave on $NODE:"
+        if [ -n "$IP" ]; then
+            REMOTE_CALL="$SETUP && sudo ip addr add $IP dev $REQUEST_VXLAN_DEV $FDB"
+        else
+            REMOTE_CALL="$SETUP $FDB"
+        fi
+
+        # echo "$REMOTE_CALL"
+        ssh -t root@"$NODE" "$REMOTE_CALL"
+    done
+}
+
 function ConfigRequestNetwork() {
     if [ $CHECK_CONFIG -ne 0 ]; then
         echo "[$REQUEST_CIDR] [dev=$REQUEST_VXLAN_DEV, parent=$REQUEST_PARENT_DEV, vnid=$REQUEST_VNID, port=$REQUEST_PORT]"
@@ -245,8 +369,8 @@ function ConfigRequestNetwork() {
         fi
     fi
 
-    SLAVE_CLIENT=underlayctl-slave
-    cp underlayctl $SLAVE_CLIENT
+    SLAVE_CLIENT="$PACKAGE-slave"
+    cp "$PACKAGE" "$SLAVE_CLIENT"
     SLAVE_SET=""
 
     for (( i = 0; i < ${#REQUEST_NODES[@]}; i++ )); do
@@ -283,8 +407,9 @@ function ConfigRequestNetwork() {
         SLAVE_ARGS="$SLAVE_ARGS $SLAVE_SET"
 
         echo "[$i] calling slave on $NODE:"
-        # shellcheck disable=SC2029
-        ssh root@"$NODE" "./$SLAVE_CLIENT slave $SLAVE_ARGS"
+        REMOTE_CALL="./$SLAVE_CLIENT slave $SLAVE_ARGS"
+        # echo "$REMOTE_CALL"
+        ssh -t root@"$NODE" "$REMOTE_CALL"
     done
 }
 
@@ -368,6 +493,21 @@ function master() {
       done
       ;;
     auto)
+       while test $# -gt 0; do
+        case "$1" in
+            -h|--help)
+              echo "$PACKAGE-master-auto - auto-configured master client for underlay mocker using vxlan tunnel"
+              echo " "
+              echo "$PACKAGE master auto [parameters] [nodes]"
+              echo "$PACKAGE master --force auto [parameters] [nodes]"
+              echo " "
+              break
+              ;;
+            *)
+              break
+              ;;
+        esac
+      done
       ReadParamFromFlags "$@"
       ConfigRequestNetwork
       echo "auto underlay network configured!"
@@ -437,11 +577,22 @@ function slave() {
     SetUpVxLAN "$PARENT_DEV" "$VXLAN_DEV" "$VNID" "$PORT"
     EnableForwarding
 
-    if [ $RET_VAL -ne 0 ]; then
-        echo "  [1] $VXLAN_DEV already exists, skip this step."
-    else
-        echo "  [1] $VXLAN_DEV installed!"
-    fi
+    case $RET_VAL in
+    0)
+      echo "  [1] $VXLAN_DEV installed!"
+      ;;
+    1)
+      echo "  [1] $VXLAN_DEV already exists, skip this step."
+      ;;
+    2)
+      echo "  [1] vnid $VNID has been occupied, abort."
+      exit 1
+      ;;
+    *)
+      echo "  [1] config of $VXLAN_DEV has changed, try add '--force' if you insist, abort."
+      exit 1
+      ;;
+    esac
 
     if [ -n "$UNDERLAY_IP" ]; then
         AssignIP "$VXLAN_DEV" "$UNDERLAY_IP"
@@ -470,6 +621,27 @@ function slave() {
     fi
 }
 
+function lite() {
+    while test $# -gt 0; do
+      case "$1" in
+          -h|--help)
+            echo "$PACKAGE-lite - lightweight client for underlay mocker using vxlan tunnel"
+            echo " "
+            echo "$PACKAGE lite [parameters] [nodes]"
+            echo " "
+            break
+            ;;
+          *)
+            break
+            ;;
+      esac
+    done
+
+    ReadParamFromFlags "$@"
+    LiteConfigRequestNetwork
+    echo "auto underlay network configured!"
+}
+
 function help() {
     echo "$PACKAGE - client for underlay mocker using vxlan tunnel"
     echo " "
@@ -479,11 +651,12 @@ function help() {
     echo "ssh-auth              authenticate ssh connection towards those nodes"
     echo "master                master-client of underlay mocker, for slave deploying and config distributing"
     echo "slave                 slave-client of underlay mocker, for concrete setting"
+    echo "lite                  lightweight client of underlay mocker without slave deploying"
     echo " "
     echo "How to use $PACKAGE to mock an underlay network on VPC:"
     echo "1. copy \"underlayctl\" and your underlay network config to one of your VPC nodes"
     echo "2. use tool \"ssh-auth\" to generate ssh key"
-    echo "3. use tool \"master\" to specify underlay network config. It will finish rest jobs."
+    echo "3. use tool \"master\" or \"lite\" to specify underlay network config. It will finish rest jobs."
 }
 
 if [ $# == 0 ]; then
@@ -492,6 +665,10 @@ if [ $# == 0 ]; then
 fi
 
 case "$1" in
+  -h|--help)
+    help
+    exit 0
+    ;;
   ssh-auth)
     shift
     ssh-auth "$@"
@@ -503,6 +680,10 @@ case "$1" in
   slave)
     shift
     slave "$@"
+    ;;
+  lite)
+    shift
+    lite "$@"
     ;;
   *)
     echo "cannot recognize tool: $1"
