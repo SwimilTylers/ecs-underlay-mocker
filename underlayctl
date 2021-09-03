@@ -33,7 +33,6 @@ function SetUpVxLAN() {
             # check if $VXLAN_DEV is a vxlan device
             if [ -n "${LINK_CHECK##*$VXLAN_DEV:*}" ]; then
                 RET_VAL=3
-                # echo "dev type changed"
                 return 0
             fi
 
@@ -44,7 +43,6 @@ function SetUpVxLAN() {
 
             if [ -n "${LINK_CHECK##*$VNID_CHECK*}" ]; then
                 RET_VAL=3
-                # echo "vnid changed"
                 return 0
             fi
 
@@ -53,7 +51,6 @@ function SetUpVxLAN() {
 
             if [ -n "${LINK_CHECK##*$PORT_CHECK*}" ]; then
                 RET_VAL=3
-                # echo "port changed"
                 return 0
             fi
 
@@ -76,18 +73,6 @@ function SetUpVxLAN() {
             return 0
         fi
     fi
-
-    #LINK_CFG='link.cfg'
-    #ip link > $LINK_CFG
-
-    #if grep -q "$VXLAN_DEV" "$LINK_CFG"; then
-    #    if [ $FORCE_SETUP_IF_EXISTS -eq 0 ]; then
-    #        rm -f $LINK_CFG
-    #        RET_VAL=1
-    #        return 0
-    #    fi
-    #    sudo ip link del "$VXLAN_DEV"
-    #fi
 
     sudo ip link add link "$PARENT_DEV" name "$VXLAN_DEV" type vxlan id "$VNID" dstport "$UDP_PORT" learning
     sudo ip link set "$VXLAN_DEV" up
@@ -114,9 +99,6 @@ function AssignIP() {
     IP=$2
     RET_VAL=0
 
-    #ADDR_CFG='addr.cfg'
-    #ip addr show dev "$VXLAN_DEV" > $ADDR_CFG
-
     ADDR_CHECK=$(ip addr show dev "$VXLAN_DEV")
 
     if [ -z "${ADDR_CHECK##*$IP*}" ]; then
@@ -124,23 +106,12 @@ function AssignIP() {
     else
         sudo ip addr add "$IP" dev "$VXLAN_DEV"
     fi
-
-    #if grep -q "$IP" "$ADDR_CFG"; then
-    #    RET_VAL=1
-    #else
-    #    sudo ip addr add "$IP" dev "$VXLAN_DEV"
-    #fi
-
-    #rm -f $ADDR_CFG
 }
 
 function AppendNewFDBEntry() {
     VXLAN_DEV=$1
     REMOTE_IP=$2
     RET_VAL=0
-
-    #FDB_CFG='fdb.cfg'
-    #bridge fdb show > $FDB_CFG
 
     FDB_CHECK=$(bridge fdb show)
     TOKEN="dev $VXLAN_DEV dst $REMOTE_IP"
@@ -150,17 +121,9 @@ function AppendNewFDBEntry() {
     else
         sudo bridge fdb append "$BROADCAST_MAC" dev "$VXLAN_DEV" dst "$REMOTE_IP" self permanent
     fi
-
-    #if grep -q "dev $VXLAN_DEV dst $REMOTE_IP" "$FDB_CFG"; then
-    #    RET_VAL=1
-    #else
-    #    bridge fdb append "$BROADCAST_MAC" dev "$VXLAN_DEV" dst "$REMOTE_IP" self permanent
-    #fi
-
-    #rm -f $FDB_CFG
 }
 
-function RouteCidr() {
+function ReplaceRouteCidr() {
     DEV=$1
     XCIDR=$2
     VIA_IP=$3
@@ -186,7 +149,7 @@ REQUEST_CIDR=''
 REQUEST_PORT=''
 REQUEST_NODES=()
 REQUEST_IPS=()
-REQUEST_GATEWAY_NODE=''
+REQUEST_ROUTE_VIA=()
 
 function ReadParamFromFlags() {
     REQUEST_VXLAN_DEV='eth1'
@@ -200,6 +163,9 @@ function ReadParamFromFlags() {
             echo "parameters:"
             echo "-h, --help                   show brief help"
             echo "--cidr=CIDR                  specify the cidr of the underlay network, omit if empty"
+            echo "--non-alloc-cidr=CIDR        specify the cidr of the underlay network without automatic ip allocation, omit if empty"
+            echo "--gateway-node=NODE          specify the gateway node of the underlay network, omit if empty"
+            echo "--connect-via-gw=CIDR        specify an outside network through gateway the underlay network connects to, omit if empty."
             echo "--underlay-dev=DEV_NAME      designate a name for the device on underlay network, default as $REQUEST_VXLAN_DEV"
             echo "--parent-dev=DEV_NAME        specify the parent device from which underlay device is derived, default as $REQUEST_PARENT_DEV"
             echo "--net-id=ID                  specify the vnid for vxlan tunnel for underlay traffic, default as $REQUEST_VNID"
@@ -276,7 +242,7 @@ function ExtractParamFromYaml() {
 
     REQUEST_NODES=()
     REQUEST_IPS=()
-    REQUEST_GATEWAY_NODE=""
+    REQUEST_ROUTE_VIA=()
 
     RANGE=$(echo "$REQUEST_CIDR" | awk '{split($0,a,"/"); print a[2]}')
     if [ -z "$RANGE" ]; then
@@ -525,7 +491,8 @@ function slave() {
     VNID=""
     PORT=""
     UNDERLAY_IP=""
-    AS_GATEWAY=""
+    ROUTE_TO=()
+    ROUTE_VIA=()
 
     while test $# -gt 0; do
       case "$1" in
@@ -541,6 +508,8 @@ function slave() {
           echo "--parent-dev=DEV_NAME        specify the parent device from which underlay device is derived"
           echo "--net-id=ID                  specify the vnid for vxlan tunnel for underlay traffic"
           echo "--udp-port=PORT              specify the udp port of vxlan tunnel for underlay traffic"
+          echo "--route-to=CIDR              add an additional route to CIDR on underlay device"
+          echo "--route-via=IP,CIDR          add an additional route to CIDR on underlay device and specify the gateway"
           echo "--force                      force to set up an underlay device even if it already exists"
           exit 0
           ;;
@@ -562,6 +531,14 @@ function slave() {
           ;;
         --udp-port*)
           PORT=`echo $1 | sed -e 's/^[^=]*=//g'`
+          shift
+          ;;
+        --route-to*)
+          ROUTE_TO+=("`echo $1 | sed -e 's/^[^=]*=//g'`")
+          shift
+          ;;
+        --route-via*)
+          ROUTE_VIA+=("`echo $1 | sed -e 's/^[^=]*=//g'`")
           shift
           ;;
         --force)
@@ -610,15 +587,19 @@ function slave() {
 
     echo "  [2] fdb on dev $VXLAN_DEV configured!"
 
-    if [ -n "$AS_GATEWAY" ]; then
-      if [ -z "$UNDERLAY_IP" ]; then
-          echo "  [3] failed to work as gateway: no underlay ip assigned"
-          exit 1
-      fi
-      echo "  [3] work as gateway node: done"
-    else
-      echo "  [3] work as normal node: done"
-    fi
+    for (( i = 0; i < ${#ROUTE_TO[@]}; i++ )); do
+        TO=${ROUTE_TO[$i]}
+        ReplaceRouteCidr "$VXLAN_DEV" "$TO"
+    done
+
+    for (( i = 0; i < ${#ROUTE_VIA[@]}; i++ )); do
+        VIA=${ROUTE_VIA[$i]}
+        VIA_IP=$(echo "$VIA" | awk '{split($0,a,","); print a[1]}')
+        TO=$(echo "$VIA" | awk '{split($0,a,","); print a[2]}')
+        ReplaceRouteCidr "$VXLAN_DEV" "$TO" "$VIA"
+    done
+
+    echo "  [3] underlay network config: done"
 }
 
 function lite() {
