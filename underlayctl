@@ -178,6 +178,11 @@ function ExtractParamFromYaml() {
     REQUEST_IPS=()
     REQUEST_GATEWAY_NODE=""
 
+    RANGE=$(echo "$REQUEST_CIDR" | awk '{split($0,a,"/"); print a[2]}')
+    if [ -z "$RANGE" ]; then
+        RANGE=24
+    fi
+
     NODES_START_FROM=$(awk '/nodes:/{print NR}' "$CONFIG")
     NODES_CFG="$(awk "NR>$NODES_START_FROM" "$CONFIG")"
 
@@ -203,6 +208,9 @@ function ExtractParamFromYaml() {
           REQUEST_NODES[$idx]=$val
           ;;
         ip)
+          if [ -z "$(echo "$val" | awk '{split($0,a,"/"); print a[2]}')" ]; then
+              val="$val/$RANGE"
+          fi
           REQUEST_IPS[$idx]=$val
           ;;
         gateway)
