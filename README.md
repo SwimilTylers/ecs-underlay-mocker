@@ -46,11 +46,10 @@ Therefore, we get config on each node (vpc iface default as `eth0`, underlay ifa
 
 If you want to specify other parameters, seek `./underlayctl lite -h` for details.
 
-Tool `lite` is a lightweight client for underlay mocker and all configuration without `scp` delivery 
-of slave clients. However, it provides no config checking and might cause some trouble in some 
-scenarios, e.g., redoing or updating.
+Tool `lite` is a lightweight client for underlay mocker. However, it provides no config checking 
+and might cause some trouble in some scenarios, e.g., redoing or updating.
 
-If you want full functionality of config checking when setting up a simple network, try 
+If you want full functionality when setting up a simple network, try 
 use `master-auto` tool. The usage is similar:
 ```shell
 # without ip allocation
