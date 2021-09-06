@@ -10,6 +10,7 @@ FORCE_SETUP_IF_EXISTS=0
 BROADCAST_MAC='00:00:00:00:00:00'
 CHECK_CONFIG=0
 EXECUTE_AFTER_DEPLOY=1
+AUTO_CONFIG_VNID=0
 RET_VAL=0
 
 # RET_VAL:
@@ -149,7 +150,7 @@ function ReadParamFromFlags() {
     REQUEST_VXLAN_DEV='eth1'
     REQUEST_PARENT_DEV='eth0'
     REQUEST_VNID=100
-    REQUEST_PORT=4096
+    REQUEST_PORT=8472
     REQUEST_ROUTE_VIA=()
 
     while test $# -gt 0; do
@@ -181,6 +182,7 @@ function ReadParamFromFlags() {
             ;;
           --net-id*)
             REQUEST_VNID=`echo $1 | sed -e 's/^[^=]*=//g'`
+            AUTO_CONFIG_VNID=0
             shift
             ;;
           --udp-port*)
@@ -227,6 +229,13 @@ function ReadParamFromFlags() {
             IP="$IP.$HOST/$RANGE"
             REQUEST_IPS[$i]=$IP
         done
+    fi
+
+    if [ $AUTO_CONFIG_VNID -ne 0 ]; then
+        DEV_NO=$(echo "$REQUEST_VXLAN_DEV" | sed 's/[^0-9]//g')
+        DEV_NO=${DEV_NO: -1}
+        REQUEST_VNID=$((REQUEST_VNID+100+DEV_NO))
+        echo "enable auto vnid config, set vnid to $REQUEST_VNID"
     fi
 }
 
@@ -290,7 +299,8 @@ function ExtractParamFromYaml() {
 }
 
 function LiteConfigRequestNetwork() {
-    SETUP="sudo ip link add link $REQUEST_PARENT_DEV name $REQUEST_VXLAN_DEV type vxlan id $REQUEST_VNID dstport $REQUEST_PORT learning && sudo ip link set $REQUEST_VXLAN_DEV up && sudo iptables -P FORWARD ACCEPT"
+    SETUP="sudo ip link del $REQUEST_VXLAN_DEV 2>/dev/null"
+    SETUP="$SETUP && sudo ip link add link $REQUEST_PARENT_DEV name $REQUEST_VXLAN_DEV type vxlan id $REQUEST_VNID dstport $REQUEST_PORT learning && sudo ip link set $REQUEST_VXLAN_DEV up && sudo iptables -P FORWARD ACCEPT"
     FDB=''
     for (( i = 0; i < ${#REQUEST_NODES[@]}; i++ )); do
         NODE=${REQUEST_NODES[$i]}
@@ -341,7 +351,7 @@ function ConfigRequestNetwork() {
     for (( i = 0; i < ${#REQUEST_NODES[@]}; i++ )); do
         NODE=${REQUEST_NODES[$i]}
         SLAVE_SET="$SLAVE_SET $NODE"
-        scp $SLAVE_CLIENT root@"$NODE":. > /dev/null
+        scp "$SLAVE_CLIENT" root@"$NODE":. > /dev/null
     done
 
     echo "all slave client sent!"
@@ -473,6 +483,7 @@ function master() {
               ;;
         esac
       done
+      AUTO_CONFIG_VNID=1
       ReadParamFromFlags "$@"
       ConfigRequestNetwork
       echo "auto underlay network configured!"
@@ -616,7 +627,7 @@ function lite() {
             ;;
       esac
     done
-
+    AUTO_CONFIG_VNID=1
     ReadParamFromFlags "$@"
     LiteConfigRequestNetwork
     echo "auto underlay network configured!"
