@@ -129,16 +129,10 @@ function ReplaceRouteCidr() {
     VIA_IP=$3
     RET_VAL=0
 
-    ROUTE_CHECK=$(ip route show dev "$DEV")
-
-    if [ -z "${ROUTE_CHECK##*$XCIDR*}" ]; then
-        RET_VAL=1
+    if [ -z "$VIA_IP" ]; then
+        sudo ip route replace "$XCIDR" dev "$DEV"
     else
-        if [ -z "$VIA_IP" ]; then
-            sudo ip route add "$XCIDR" dev "$DEV"
-        else
-            sudo ip route add "$XCIDR" dev "$DEV" via "$VIA_IP" onlink
-        fi
+        sudo ip route replace "$XCIDR" dev "$DEV" via "$VIA_IP" onlink
     fi
 }
 
@@ -156,6 +150,7 @@ function ReadParamFromFlags() {
     REQUEST_PARENT_DEV='eth0'
     REQUEST_VNID=100
     REQUEST_PORT=4096
+    REQUEST_ROUTE_VIA=()
 
     while test $# -gt 0; do
       case "$1" in
@@ -163,9 +158,9 @@ function ReadParamFromFlags() {
             echo "parameters:"
             echo "-h, --help                   show brief help"
             echo "--cidr=CIDR                  specify the cidr of the underlay network, omit if empty"
-            echo "--non-alloc-cidr=CIDR        specify the cidr of the underlay network without automatic ip allocation, omit if empty"
-            echo "--gateway-node=NODE          specify the gateway node of the underlay network, omit if empty"
-            echo "--connect-via-gw=CIDR        specify an outside network through gateway the underlay network connects to, omit if empty."
+#            echo "--gateway-node=NODE          specify the gateway node of the underlay network, omit if empty"
+#            echo "--add-route=CIDR             add an additional route to underlay network"
+#            echo "--add-route-via-gw=CIDR      add an additional route via underlay network gateway. Choose the first node as gateway if not specified"
             echo "--underlay-dev=DEV_NAME      designate a name for the device on underlay network, default as $REQUEST_VXLAN_DEV"
             echo "--parent-dev=DEV_NAME        specify the parent device from which underlay device is derived, default as $REQUEST_PARENT_DEV"
             echo "--net-id=ID                  specify the vnid for vxlan tunnel for underlay traffic, default as $REQUEST_VNID"
@@ -211,24 +206,28 @@ function ReadParamFromFlags() {
     fi
 
     NET=$(echo "$REQUEST_CIDR" | awk '{split($0,a,"/"); print a[1]}')
+    BASE=$(echo "$NET" | awk '{split($0,a,"\."); print a[4]}' 2>/dev/null)
     RANGE=$(echo "$REQUEST_CIDR" | awk '{split($0,a,"/"); print a[2]}')
 
     if [ -z "$RANGE" ]; then
         RANGE=24
     fi
 
-    if [[ $RANGE -gt 24 ]]; then
-        echo "currently not support cidr $REQUEST_CIDR"
-        return 1
+    if [[ $RANGE -eq 32 ]]; then
+        if [ ${#REQUEST_NODES[@]} -ne 1 ]; then
+            echo "$REQUEST_CIDR only supports one single node, abort"
+            exit 1
+        fi
+        REQUEST_IPS[0]="$REQUEST_CIDR"
+    else
+        for (( i = 0; i < ${#REQUEST_NODES[@]}; i++ )); do
+            NODE=${REQUEST_NODES[$i]}
+            IP="$(echo "$NET" | awk '{split($0,a,"\."); print a[1]}' 2>/dev/null).$(echo "$NET" | awk '{split($0,a,"\."); print a[2]}' 2>/dev/null).$(echo "$NET" | awk '{split($0,a,"\."); print a[3]}' 2>/dev/null)"
+            HOST=$((BASE+i+1))
+            IP="$IP.$HOST/$RANGE"
+            REQUEST_IPS[$i]=$IP
+        done
     fi
-
-    for (( i = 0; i < ${#REQUEST_NODES[@]}; i++ )); do
-        NODE=${REQUEST_NODES[$i]}
-        IP="$(echo "$NET" | awk '{split($0,a,"\."); print a[1]}' 2>/dev/null).$(echo "$NET" | awk '{split($0,a,"\."); print a[2]}' 2>/dev/null).$(echo "$NET" | awk '{split($0,a,"\."); print a[3]}' 2>/dev/null)"
-        HOST=$((i+1))
-        IP="$IP.$HOST/$RANGE"
-        REQUEST_IPS[$i]=$IP
-    done
 }
 
 function ExtractParamFromYaml() {
