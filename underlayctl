@@ -11,6 +11,7 @@ BROADCAST_MAC='00:00:00:00:00:00'
 CHECK_CONFIG=0
 EXECUTE_AFTER_DEPLOY=1
 AUTO_CONFIG_VNID=0
+SHOW_REMOTE_CALL=0
 RET_VAL=0
 
 # RET_VAL:
@@ -299,13 +300,30 @@ function ExtractParamFromYaml() {
 }
 
 function LiteConfigRequestNetwork() {
-    SETUP="sudo ip link del $REQUEST_VXLAN_DEV 2>/dev/null"
-    SETUP="$SETUP && sudo ip link add link $REQUEST_PARENT_DEV name $REQUEST_VXLAN_DEV type vxlan id $REQUEST_VNID dstport $REQUEST_PORT learning && sudo ip link set $REQUEST_VXLAN_DEV up && sudo iptables -P FORWARD ACCEPT"
+    # shellcheck disable=SC2016
+    LINK_CHECK='$(ip link)'
+    DEL_IF_EXISTS="if grep -q $REQUEST_VXLAN_DEV <<< $LINK_CHECK; then sudo ip link del $REQUEST_VXLAN_DEV; fi"
+
+    SETUP="sudo ip link add link $REQUEST_PARENT_DEV name $REQUEST_VXLAN_DEV type vxlan id $REQUEST_VNID dstport $REQUEST_PORT learning && sudo ip link set $REQUEST_VXLAN_DEV up && sudo iptables -P FORWARD ACCEPT"
+
     FDB=''
     for (( i = 0; i < ${#REQUEST_NODES[@]}; i++ )); do
         NODE=${REQUEST_NODES[$i]}
         FDB="$FDB && sudo bridge fdb append $BROADCAST_MAC dev $REQUEST_VXLAN_DEV dst $NODE self permanent"
     done
+
+    ROUTE=''
+    for i in "${!REQUEST_ROUTE_VIA[@]}"
+    do
+      TO="$i"
+      VIA="${REQUEST_ROUTE_VIA[$i]}"
+      if [ -n "$VIA" ]; then
+          ROUTE="$ROUTE && sudo ip route replace $TO dev $REQUEST_VXLAN_DEV via $VIA onlink"
+      else
+          ROUTE="$ROUTE && sudo ip route replace $TO dev $REQUEST_VXLAN_DEV"
+      fi
+    done
+
 
     for (( i = 0; i < ${#REQUEST_NODES[@]}; i++ )); do
         NODE=${REQUEST_NODES[$i]}
@@ -313,12 +331,16 @@ function LiteConfigRequestNetwork() {
 
         echo "[$i] calling slave on $NODE:"
         if [ -n "$IP" ]; then
-            REMOTE_CALL="$SETUP && sudo ip addr add $IP dev $REQUEST_VXLAN_DEV $FDB"
+            REMOTE_CALL="$DEL_IF_EXISTS && $SETUP && sudo ip addr add $IP dev $REQUEST_VXLAN_DEV $FDB $ROUTE"
         else
-            REMOTE_CALL="$SETUP $FDB"
+            REMOTE_CALL="$DEL_IF_EXISTS && $SETUP $FDB $ROUTE"
         fi
 
         # echo "$REMOTE_CALL"
+        # echo "remote-call: $REMOTE_CALL"
+        if [ $SHOW_REMOTE_CALL -ne 0 ]; then
+            echo "$REMOTE_CALL"
+        fi
         ssh -t root@"$NODE" "$REMOTE_CALL"
     done
 }
@@ -383,7 +405,9 @@ function ConfigRequestNetwork() {
 
         echo "[$i] calling slave on $NODE:"
         REMOTE_CALL="./$SLAVE_CLIENT slave $SLAVE_ARGS"
-        # echo "$REMOTE_CALL"
+        if [ $SHOW_REMOTE_CALL -ne 0 ]; then
+            echo "$REMOTE_CALL"
+        fi
         ssh -t root@"$NODE" "$REMOTE_CALL"
     done
 }
@@ -618,8 +642,13 @@ function lite() {
           -h|--help)
             echo "$PACKAGE-lite - lightweight client for underlay mocker using vxlan tunnel"
             echo " "
-            echo "$PACKAGE lite [parameters] [nodes]"
-            echo " "
+            echo "$PACKAGE lite [-h|--help]"
+            echo "$PACKAGE lite [-v|--verbose] [parameters] [nodes]"
+            break
+            ;;
+          -v|--verbose)
+            SHOW_REMOTE_CALL=1
+            shift
             break
             ;;
           *)

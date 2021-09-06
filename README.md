@@ -29,6 +29,10 @@ The `lite` is a lightweight client for underlay mocker and all configuration rel
 3. use tool `lite` and specify VPC nodes. It will generate underlay network config 
    automatically and finish the rest jobs.
 
+For other parameters, seek `./underlayctl lite -h` for details.
+
+### IP Allocation
+
 If you want to set up an underlay network among these vpc nodes
 `172.19.18.228/30, 172.19.18.229/30, 172.19.18.230/30`,  try this cmd
 ```shell
@@ -44,18 +48,46 @@ Therefore, we get config on each node (vpc iface default as `eth0`, underlay ifa
 - `eth0=172.19.18.229/30, eth1=192.168.56.2/24`
 - `eth0=172.19.18.230/30, eth1=192.168.56.3/24`
 
-If you want to specify other parameters, seek `./underlayctl lite -h` for details.
+Tool `lite` allocates IP according to the order of your NODEs.
 
-Tool `lite` is a lightweight client for underlay mocker. However, it provides no config checking 
-and might cause some trouble in some scenarios, e.g., redoing or updating.
+### Update Configuration
 
-If you want full functionality when setting up a simple network, try 
-use `master-auto` tool. The usage is similar:
+**WARNING**: we do not support _delete-node-operation_.
+
+Tool `lite` will brutally delete specified underlay network device (default as `eth1`) on each node if exists before 
+any configuration. If you want to **add nodes**, or **assign/delete/reallocate underlay ip**, redo the command
+straightforward.
+
+Set up an underlay network through:
+
 ```shell
-# without ip allocation
-./underlayctl master auto 172.19.18.228 172.19.18.229 172.19.18.230
-# with ip allocation
-./underlayctl master auto --cidr=192.168.56.0/24 172.19.18.228 172.19.18.229 172.19.18.230
+./underlayctl lite --cidr=192.168.56.0/24 172.19.18.228 172.19.18.229
+```
+Thus, we get
+- `eth0=172.19.18.228/30, eth1=192.168.56.1/24`
+- `eth0=172.19.18.229/30, eth1=192.168.56.2/24`
+
+To add a node `172.19.18.230` to the network, run:
+
+```shell
+./underlayctl lite --cidr=192.168.56.0/24 172.19.18.228 172.19.18.229 172.19.18.230
+```
+Thus, we get:
+- `eth0=172.19.18.228/30, eth1=192.168.56.1/24`
+- `eth0=172.19.18.229/30, eth1=192.168.56.2/24`
+- `eth0=172.19.18.230/30, eth1=192.168.56.3/24`
+
+### Multiple Networks
+
+If you want to install multiple underlay networks, you have to specify the underlay network device through
+`--underlay-dev` parameter explicitly. The VNID of VxLAN is automatically allocated (201-209) unless you specify it explicitly 
+through `--net-id` parameter. 
+
+```shell
+# install an underlay network on eth1, vnid is auto-configured to 201
+./underlayctl lite --underlay-dev=eth1 --cidr=192.168.56.0/24 172.19.18.230 172.19.18.228 172.19.18.229
+# install another underlay network on eth2, vnid is auto-configured to 202
+./underlayctl lite --underlay-dev=eth2 --cidr=192.168.56.0/24 172.19.18.230 172.19.18.231 172.19.18.232
 ```
 
 ## Configure a more complicated network
