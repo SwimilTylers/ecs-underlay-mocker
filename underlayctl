@@ -37,6 +37,7 @@ function ReadParamFromFlags() {
           -h|--help)
             echo "parameters:"
             echo "-h, --help                   show brief help"
+            echo "-v, --verbose                show the content of remote calls"
             echo "--cidr=CIDR                  specify the cidr of the underlay network, omit if empty"
             echo "--gateway-ip=IP              specify the underlay ip of the gateway, auto-configured if cidr is assigned"
             echo "--add-route-to=CIDR          add an additional route to underlay network device"
@@ -81,6 +82,10 @@ function ReadParamFromFlags() {
             ;;
           --udp-port*)
             REQUEST_PORT=`echo $1 | sed -e 's/^[^=]*=//g'`
+            shift
+            ;;
+          -v|--verbose)
+            SHOW_REMOTE_CALL=1
             shift
             ;;
           *)
@@ -365,11 +370,6 @@ function install() {
             echo " "
             break
             ;;
-          -v|--verbose)
-            SHOW_REMOTE_CALL=1
-            shift
-            break
-            ;;
           *)
             break
             ;;
@@ -390,11 +390,6 @@ function remove() {
             echo "$PACKAGE remove [-h|--help]"
             echo "$PACKAGE remove [-v|--verbose] [parameters] [nodes]"
             echo " "
-            break
-            ;;
-          -v|--verbose)
-            SHOW_REMOTE_CALL=1
-            shift
             break
             ;;
           *)
