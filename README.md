@@ -6,162 +6,99 @@ Mocking an L2-underlay network over ECS L3-VPC.
 underlayctl tool [-h|--help] [options] [other arguments]
  
 tools:
-ssh-auth     authenticate ssh connection towards those nodes
-master       master-client of underlay mocker, for slave deploying and config distributing
-slave        slave-client of underlay mocker, for concrete setting
-lite         lightweight client of underlay mocker without slave deploying
+ssh-auth              authenticate ssh connection towards those nodes
+describe              describe config of the underlay network
+install               mocking an underlay network using vxlan tunnel
 ```
 
-The mocking process requires `ssh` and `scp` operations. `ssh-auth` relates to 
-ssh authentication, relieving you from tedious typing of passwords.
-
-The `master` loads config and deploys `slave` across nodes automatically. 
-In normal case, you ONLY have to care about `master` tool and underlay network config. 
-Direct use of `slave` tool is NOT preferable, unless some error occurs.
-
-The `lite` is a lightweight client for underlay mocker and all configuration relies on
-`ssh` remote calls without `scp` delivery of slave clients. You can use it as a quick start.
-
-## Configure a simple underlay network
-
-1. copy `underlayctl` to one of your VPC nodes
+The mocking process requires `ssh` operations. `ssh-auth` relates to 
+ssh authentication, relieving you from tedious typing of passwords. The `descibe` 
+tool displays the (expected) config of the underlay network, while `install` carries
+out the config.
+- If you are unfamiliar with the underlay network config, use `describe` to 
+  check it out.
+- If some failure occurs during the config, add `-v` when running `install`. It 
+  prints out the actual commands.
+  
+When you use this tool, follow these steps:
+1. copy `underlayctl` to somewhere connects your VPC nodes
 2. (if necessary) use tool `ssh-auth` to grant ssh authentication.
-3. use tool `lite` and specify VPC nodes. It will generate underlay network config 
+3. run tool `install` and specify VPC nodes. It will generate underlay network config
    automatically and finish the rest jobs.
-
-For other parameters, seek `./underlayctl lite -h` for details.
-
-### IP Allocation
-
-If you want to set up an underlay network among these vpc nodes
-`172.19.18.228/30, 172.19.18.229/30, 172.19.18.230/30`,  try this cmd
-```shell
-./underlayctl lite 172.19.18.228 172.19.18.229 172.19.18.230
-```
-If you want to assign underlay ip to those nodes automatically, please specify 
-CIDR of the underlay network.
-```shell
-./underlayctl lite --cidr=192.168.56.0/24 172.19.18.228 172.19.18.229 172.19.18.230
-```
-Therefore, we get config on each node (vpc iface default as `eth0`, underlay iface default as `eth1`):
-- `eth0=172.19.18.228/30, eth1=192.168.56.1/24`
-- `eth0=172.19.18.229/30, eth1=192.168.56.2/24`
-- `eth0=172.19.18.230/30, eth1=192.168.56.3/24`
-
-Tool `lite` allocates IP according to the order of your NODEs.
-
-### Update Configuration
-
-**WARNING**: we do not support _delete-node-operation_.
-
-Tool `lite` will brutally delete specified underlay network device (default as `eth1`) on each node if exists before 
-any configuration. If you want to **add nodes**, or **assign/delete/reallocate underlay ip**, redo the command
-straightforward.
-
-Set up an underlay network through:
-
-```shell
-./underlayctl lite --cidr=192.168.56.0/24 172.19.18.228 172.19.18.229
-```
-Thus, we get
-- `eth0=172.19.18.228/30, eth1=192.168.56.1/24`
-- `eth0=172.19.18.229/30, eth1=192.168.56.2/24`
-
-To add a node `172.19.18.230` to the network, run:
-
-```shell
-./underlayctl lite --cidr=192.168.56.0/24 172.19.18.228 172.19.18.229 172.19.18.230
-```
-Thus, we get:
-- `eth0=172.19.18.228/30, eth1=192.168.56.1/24`
-- `eth0=172.19.18.229/30, eth1=192.168.56.2/24`
-- `eth0=172.19.18.230/30, eth1=192.168.56.3/24`
-
-### Multiple Networks
-
-If you want to install multiple underlay networks, you have to specify the underlay network device through
-`--underlay-dev` parameter explicitly. The VNID of VxLAN is automatically allocated (201-209) unless you specify it explicitly 
-through `--net-id` parameter. 
-
-```shell
-# install an underlay network on eth1, vnid is auto-configured to 201
-./underlayctl lite --underlay-dev=eth1 --cidr=192.168.56.0/24 172.19.18.230 172.19.18.228 172.19.18.229
-# install another underlay network on eth2, vnid is auto-configured to 202
-./underlayctl lite --underlay-dev=eth2 --cidr=192.168.56.0/24 172.19.18.230 172.19.18.231 172.19.18.232
-```
-
-## Configure a more complicated network
-
-### How to write an underlay config
-
-We offer a sample yaml `config/net.yaml`.
-1. declare the vxlan config used for underlay mocking, consisting of
-    - `dev` device of underlay network
-    - `parent` device of vpc network
-    - `vnid` vnid of vxlan tunnel
-    - `port` udp port of vxlan frame
-    - `cidr` cidr of the underlay network
-2. declare the nodes upon which we mock the underlay network, starting with `nodes`
-    - `node` vpc ip of the node
-    - `ip` underlay ip of the node, omit if empty
-    - `gateway` whether the node is an underlay gateway, `no` if empty. 
-      Once you set this field as `yes`, the `ip` must NOT be empty. 
-      Otherwise, it will abort.
-
-### How to apply an underlay config
-
-1. copy `underlayctl` and your underlay network config to one of your VPC nodes
-2. (if necessary) use tool `ssh-auth` to generate ssh authentication.
-3. use tool `master` to specify underlay network config. It will finish rest jobs.
    
-If you want to use the sample config, try this: `./underlayctl master --check-config using config/net.yaml`.
+## Demos
+1. If you want to set up an underlay network among these vpc nodes
+   `172.19.18.228/30, 172.19.18.229/30, 172.19.18.230/30`, try this cmd:
+   ```shell
+   ./underlayctl install 172.19.18.228 172.19.18.229 172.19.18.230
+   ```
+2. If you want to allocate underlay network **IP** (`192.168.56.0/24`) among nodes, 
+   add the flag `--cidr=192.168.56.0/24`:
+   ```shell
+   ./underlayctl install --cidr=192.168.56.0/24 172.19.18.228 172.19.18.229 172.19.18.230
+   ```
+3. If you want to specify the UNIQUE underlay network **gateway** (`172.19.18.228`), you have to add the prefix
+   to `gw:` the node:
+   ```shell
+   ./underlayctl install --cidr=192.168.56.0/24 gw:172.19.18.228 172.19.18.229 172.19.18.230
+   ```
+4. If you want to **connect** the underlay network **to another network** (`10.96.0.0/12`) via the gateway (`172.19.18.228`),
+   add the flag `--add-route-via-gw=10.96.0.0/12`:
+   ```shell
+   ./underlayctl install --cidr=192.168.56.0/24 --add-route-via-gw=10.96.0.0/12 gw:172.19.18.228 172.19.18.229 172.19.18.230
+   ```
+5. If you want to **add a node** (`172.19.18.231`) right now, append it to the of the last cmd directly:
+   ```shell
+   ./underlayctl install --cidr=192.168.56.0/24 --add-route-via-gw=10.96.0.0/12 gw:172.19.18.228 172.19.18.229 172.19.18.230 172.19.18.231
+   ```
 
+You can replace `install` with `describe` to check the config at any step:
+```
+# Print by the following cmd:
+# ./underlayctl describe --cidr=192.168.56.0/24 --add-route-via-gw=10.96.0.0/12 gw:172.19.18.228 172.19.18.229 172.19.18.230 172.19.18.231
 
-### How to update an underlay config
-**WARNING**: we do not support _delete-node-operation_.
+[NODES, cidr=192.168.56.0/24, vnid=201, port=8472]
+[0] [eth0=172.19.18.228, eth1=192.168.56.1/24, gateway]
+[1] [eth0=172.19.18.229, eth1=192.168.56.2/24]
+[2] [eth0=172.19.18.230, eth1=192.168.56.3/24]
+[3] [eth0=172.19.18.231, eth1=192.168.56.4/24]
+[MORE ROUTES]
+[0] [10.96.0.0/12 dev eth1 via 192.168.56.1 onlink]
+```
 
-You have to edit the config and resubmit it to `master`. To be mentioned, if you
-update vxlan device config (e.g., vnid), you would better add `--force` option.
+## Aonther Demo: two connected network for k8s cluster
+
+I have five vpc nodes: `172.19.18.232, 172.19.18.229, 172.19.18.230, 172.19.18.231, 172.19.18.228`
+
+I want set up two underlay networks. Both connect to each other via `172.19.18.232`.
++ `192.168.56.0/24`: consisting of `172.19.18.232, 172.19.18.229, 172.19.18.230`
++ `192.168.57.0/24`: consisting of `172.19.18.232, 172.19.18.231, 172.19.18.228`
+
+I want to install k8s clusters upon both the underlay networks with kubeadm. I use default service cidr (`10.96.0.0/12`).
+On node `172.19.18.232`, run the following commands:
 
 ```shell
-./underlayctl master --check-config --force using config/net.yaml
+./underlayctl install --cidr=192.168.56.0/24 --add-route-to=10.96.0.0/12 --add-route-via-gw=192.168.57.0/24 gw:172.19.18.232 172.19.18.229 172.19.18.230
+./underlayctl install --cidr=192.168.57.0/24 --add-route-to=10.96.0.0/12 --add-route-via-gw=192.168.56.0/24 gw:172.19.18.232 172.19.18.231 172.19.18.228
 ```
 
-## Man Page for `underlayctl-master`
-
-There are two ways of usage:
+## More options
 ```
-underlayctl master [options] using [files]
-underlayctl master [options] auto [parameters] [nodes]
-```
-### Options
-1. `--check-config` if set, it will display each config it loads and pause until
-   you confirm the config. We recommend you to turn this option on because our yaml
-   parser is not so robust, and manual checking will reduce the possibility of further
-   misconfiguration.
-2. `--force` if set, it will delete the underlay device before setting the device up.
+underlayctl-install - mocking an underlay network using vxlan tunnel
 
-### Using config from files
-
-If you want to configure several underlay networks at one time, choose this way.
-
-### Using auto-generated config
-
-We can automatically generate underlay network config for given nodes, allowing integration
-into other testing tools. You can specify some parameters, or using default ones. Client `master` will pass
-these parameters to `slave` clients accordingly.
-
-To be mentioned, if you specify CIDR of the underlay network, we will automatically
-assign underlay ip to each node. If you want more specified config, please choose aforementioned loaded config.
-
-```
-underlayctl master auto [parameters] [nodes]
+underlayctl install [-h|--help]
+underlayctl install [-v|--verbose] [parameters] [nodes]
+underlayctl install [-v|--verbose] [parameters] [gw:gateway_node] [other_nodes]
  
 parameters:
 -h, --help                   show brief help
+-v, --verbose                show the content of remote calls
 --cidr=CIDR                  specify the cidr of the underlay network, omit if empty
+--gateway-ip=IP              specify the underlay ip of the gateway, auto-configured if cidr is assigned
+--add-route-to=CIDR          add an additional route to underlay network device
+--add-route-via-gw=CIDR      add an additional route via underlay network gateway
 --underlay-dev=DEV_NAME      designate a name for the device on underlay network, default as eth1
 --parent-dev=DEV_NAME        specify the parent device from which underlay device is derived, default as eth0
---net-id=ID                  specify the vnid for vxlan tunnel for underlay traffic, default as 100
---udp-port=PORT              specify the udp port of vxlan tunnel for underlay traffic, default as 4096
+--net-id=ID                  specify the vnid for vxlan tunnel for underlay traffic, auto-configured if empty
+--udp-port=PORT              specify the udp port of vxlan tunnel for underlay traffic, default as 8472
 ```
