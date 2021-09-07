@@ -6,137 +6,9 @@ set -o pipefail
 
 PACKAGE=$(basename "${BASH_SOURCE[0]}")
 
-FORCE_SETUP_IF_EXISTS=0
 BROADCAST_MAC='00:00:00:00:00:00'
-CHECK_CONFIG=0
-EXECUTE_AFTER_DEPLOY=1
 AUTO_CONFIG_VNID=0
 SHOW_REMOTE_CALL=0
-RET_VAL=0
-
-# RET_VAL:
-# - 0: installed
-# - 1: skip
-# - 2: vnid occupied
-# - 3: dev config out-of-date
-function SetUpVxLAN() {
-    PARENT_DEV=$1
-    VXLAN_DEV=$2
-    VNID=$3
-    UDP_PORT=$4
-    RET_VAL=0
-
-    LINK_CHECK=$(ip link)
-
-    if [ -z "${LINK_CHECK##*$VXLAN_DEV:*}" ]; then
-        if [ $FORCE_SETUP_IF_EXISTS -eq 0 ]; then
-            LINK_CHECK=$(ip -d link show type vxlan)
-
-            # check if $VXLAN_DEV is a vxlan device
-            if [ -n "${LINK_CHECK##*$VXLAN_DEV:*}" ]; then
-                RET_VAL=3
-                return 0
-            fi
-
-            LINK_CHECK=$(ip -d link show dev "$VXLAN_DEV" | grep vxlan)
-
-            # check if vnid of $VXLAN_DEV has changed
-            VNID_CHECK="id $VNID"
-
-            if [ -n "${LINK_CHECK##*$VNID_CHECK*}" ]; then
-                RET_VAL=3
-                return 0
-            fi
-
-            # check if udp port of $VXLAN_DEV has changed
-            PORT_CHECK="dstport $UDP_PORT"
-
-            if [ -n "${LINK_CHECK##*$PORT_CHECK*}" ]; then
-                RET_VAL=3
-                return 0
-            fi
-
-            # pass all check, skip it
-            RET_VAL=1
-            return 0
-        fi
-        sudo ip link del "$VXLAN_DEV"
-    fi
-
-    LINK_CHECK=$(ip -d link show type vxlan)
-
-    if [ -n "$LINK_CHECK" ]; then
-        OTHER_VXLAN_CFG=$(echo "$LINK_CHECK" | grep vxlan)
-
-        VNID_CHECK="id $VNID"
-
-        if [ -z "${OTHER_VXLAN_CFG##*$VNID_CHECK*}" ]; then
-            RET_VAL=2
-            return 0
-        fi
-    fi
-
-    sudo ip link add link "$PARENT_DEV" name "$VXLAN_DEV" type vxlan id "$VNID" dstport "$UDP_PORT" learning
-    sudo ip link set "$VXLAN_DEV" up
-
-    #rm -f $LINK_CFG
-}
-
-function DelVxLan() {
-    VXLAN_DEV=$1
-
-    LINK_CHECK=$(ip link)
-
-    if [ -z "${LINK_CHECK##*$VXLAN_DEV:*}" ]; then
-        sudo ip link del "$VXLAN_DEV"
-    fi
-}
-
-function EnableForwarding() {
-    sudo iptables -P FORWARD ACCEPT
-}
-
-function AssignIP() {
-    VXLAN_DEV=$1
-    IP=$2
-    RET_VAL=0
-
-    ADDR_CHECK=$(ip addr show dev "$VXLAN_DEV")
-
-    if [ -z "${ADDR_CHECK##*$IP*}" ]; then
-        RET_VAL=1
-    else
-        sudo ip addr add "$IP" dev "$VXLAN_DEV"
-    fi
-}
-
-function AppendNewFDBEntry() {
-    VXLAN_DEV=$1
-    REMOTE_IP=$2
-    RET_VAL=0
-
-    FDB_CHECK=$(bridge fdb show)
-    TOKEN="dev $VXLAN_DEV dst $REMOTE_IP"
-
-    if [ -z "${FDB_CHECK##*$TOKEN*}" ]; then
-        RET_VAL=1
-    else
-        sudo bridge fdb append "$BROADCAST_MAC" dev "$VXLAN_DEV" dst "$REMOTE_IP" self permanent
-    fi
-}
-
-function ReplaceRouteCidr() {
-    DEV=$1
-    XCIDR=$2
-    VIA_IP=$3
-    RET_VAL=0
-
-    if [ -z "$VIA_IP" ]; then
-        sudo ip route replace "$XCIDR" dev "$DEV"
-    else
-        sudo ip route replace "$XCIDR" dev "$DEV" via "$VIA_IP" onlink
-    fi
-}
 
 REQUEST_VXLAN_DEV=''
 REQUEST_PARENT_DEV=''
@@ -145,6 +17,9 @@ REQUEST_CIDR=''
 REQUEST_PORT=''
 REQUEST_NODES=()
 REQUEST_IPS=()
+REQUEST_GW_NODE=''
+REQUEST_GW_IP=''
+REQUEST_ROUTE_TO=()
 REQUEST_ROUTE_VIA=()
 
 function ReadParamFromFlags() {
@@ -152,6 +27,9 @@ function ReadParamFromFlags() {
     REQUEST_PARENT_DEV='eth0'
     REQUEST_VNID=100
     REQUEST_PORT=8472
+    REQUEST_GW_NODE=''
+    REQUEST_GW_IP=''
+    REQUEST_ROUTE_TO=()
     REQUEST_ROUTE_VIA=()
 
     while test $# -gt 0; do
@@ -160,17 +38,32 @@ function ReadParamFromFlags() {
             echo "parameters:"
             echo "-h, --help                   show brief help"
             echo "--cidr=CIDR                  specify the cidr of the underlay network, omit if empty"
-#            echo "--gateway-node=NODE          specify the gateway node of the underlay network, omit if empty"
-#            echo "--add-route=CIDR             add an additional route to underlay network"
-#            echo "--add-route-via-gw=CIDR      add an additional route via underlay network gateway. Choose the first node as gateway if not specified"
+            echo "--gateway-ip=IP              specify the underlay ip of the gateway, auto-configured if cidr is assigned"
+            echo "--add-route-to=CIDR          add an additional route to underlay network device"
+            echo "--add-route-via-gw=CIDR      add an additional route via underlay network gateway"
             echo "--underlay-dev=DEV_NAME      designate a name for the device on underlay network, default as $REQUEST_VXLAN_DEV"
             echo "--parent-dev=DEV_NAME        specify the parent device from which underlay device is derived, default as $REQUEST_PARENT_DEV"
-            echo "--net-id=ID                  specify the vnid for vxlan tunnel for underlay traffic, default as $REQUEST_VNID"
+            echo "--net-id=ID                  specify the vnid for vxlan tunnel for underlay traffic, auto-configured if empty"
             echo "--udp-port=PORT              specify the udp port of vxlan tunnel for underlay traffic, default as $REQUEST_PORT"
             exit 0
             ;;
           --cidr*)
             REQUEST_CIDR=`echo $1 | sed -e 's/^[^=]*=//g'`
+            shift
+            ;;
+          --gateway-ip*)
+            REQUEST_GW_IP=`echo $1 | sed -e 's/^[^=]*=//g'`
+            REQUEST_GW_IP=$(echo "$REQUEST_GW_IP" | awk '{split($0,a,"/"); print a[1]}')
+            shift
+            ;;
+          --add-route-to*)
+            CIDR=`echo $1 | sed -e 's/^[^=]*=//g'`
+            REQUEST_ROUTE_TO+=("$CIDR")
+            shift
+            ;;
+          --add-route-via-gw*)
+            CIDR=`echo $1 | sed -e 's/^[^=]*=//g'`
+            REQUEST_ROUTE_VIA+=("$CIDR")
             shift
             ;;
           --underlay-dev*)
@@ -199,11 +92,61 @@ function ReadParamFromFlags() {
     REQUEST_NODES=()
 
     while test $# -gt 0; do
-        REQUEST_NODES+=("$1")
-        shift
+        case $1 in
+        gw:*)
+          NODE=${1#"gw:"}
+          if [ -n "$REQUEST_GW_NODE" ]; then
+              echo "find multiple gw, abort: $REQUEST_GW_NODE, $NODE"
+              return 1
+          else
+              REQUEST_GW_NODE=$NODE
+          fi
+          shift
+          ;;
+        *)
+          NODE=$1
+          shift
+          ;;
+        esac
+        REQUEST_NODES+=("$NODE")
     done
 
+    if [ ${#REQUEST_NODES[@]} -eq 0 ]; then
+        echo "must offer some nodes"
+        return 1
+    fi
+
+    if [ $AUTO_CONFIG_VNID -ne 0 ]; then
+        DEV_NO=$(echo "$REQUEST_VXLAN_DEV" | sed 's/[^0-9]//g')
+        DEV_NO=${DEV_NO: -1}
+        REQUEST_VNID=$((REQUEST_VNID+100+DEV_NO))
+        echo "enable auto vnid config, set vnid to $REQUEST_VNID"
+    fi
+
+    if [ -z "$REQUEST_GW_NODE" ]; then
+        if [ ${#REQUEST_ROUTE_VIA[@]} -ne 0 ]; then
+            echo "must specify a gateway if you want to route via it"
+            return 1
+        fi
+    fi
+
     if [ -z "$REQUEST_CIDR" ]; then
+        if [ -n "$REQUEST_GW_NODE" ]; then
+            if [ -z "$REQUEST_GW_IP" ]; then
+                echo "no gateway ip available for $REQUEST_GW_NODE, abort"
+                return 1
+            fi
+
+            for (( i = 0; i < ${#REQUEST_NODES[@]}; i++ )); do
+                NODE=${REQUEST_NODES[$i]}
+
+                if [ $NODE == $REQUEST_GW_NODE ]; then
+                    REQUEST_IPS[$i]=$REQUEST_GW_IP
+                    break
+                fi
+            done
+        fi
+
         echo "no cidr found, stop underlay ip auto assignment"
         return 0
     fi
@@ -211,9 +154,25 @@ function ReadParamFromFlags() {
     NET=$(echo "$REQUEST_CIDR" | awk '{split($0,a,"/"); print a[1]}')
     BASE=$(echo "$NET" | awk '{split($0,a,"\."); print a[4]}' 2>/dev/null)
     RANGE=$(echo "$REQUEST_CIDR" | awk '{split($0,a,"/"); print a[2]}')
+    IDX=1
 
     if [ -z "$RANGE" ]; then
         RANGE=24
+    fi
+
+    if [ -n "$REQUEST_GW_NODE" ]; then
+        if [ -z "$REQUEST_GW_IP" ]; then
+            # auto-configure gw ip
+            if [[ $RANGE -eq 32 ]]; then
+                REQUEST_GW_IP=$(echo "$REQUEST_CIDR" | awk '{split($0,a,"/"); print a[1]}')
+            else
+                REQUEST_GW_IP="$(echo "$NET" | awk '{split($0,a,"\."); print a[1]}' 2>/dev/null).$(echo "$NET" | awk '{split($0,a,"\."); print a[2]}' 2>/dev/null).$(echo "$NET" | awk '{split($0,a,"\."); print a[3]}' 2>/dev/null)"
+                HOST=$((BASE+1))
+                IDX=2
+                REQUEST_GW_IP="$REQUEST_GW_IP.$HOST"
+            fi
+            echo "enable auto gw ip config, set it to $REQUEST_GW_IP"
+        fi
     fi
 
     if [[ $RANGE -eq 32 ]]; then
@@ -225,78 +184,52 @@ function ReadParamFromFlags() {
     else
         for (( i = 0; i < ${#REQUEST_NODES[@]}; i++ )); do
             NODE=${REQUEST_NODES[$i]}
-            IP="$(echo "$NET" | awk '{split($0,a,"\."); print a[1]}' 2>/dev/null).$(echo "$NET" | awk '{split($0,a,"\."); print a[2]}' 2>/dev/null).$(echo "$NET" | awk '{split($0,a,"\."); print a[3]}' 2>/dev/null)"
-            HOST=$((BASE+i+1))
-            IP="$IP.$HOST/$RANGE"
-            REQUEST_IPS[$i]=$IP
-        done
-    fi
 
-    if [ $AUTO_CONFIG_VNID -ne 0 ]; then
-        DEV_NO=$(echo "$REQUEST_VXLAN_DEV" | sed 's/[^0-9]//g')
-        DEV_NO=${DEV_NO: -1}
-        REQUEST_VNID=$((REQUEST_VNID+100+DEV_NO))
-        echo "enable auto vnid config, set vnid to $REQUEST_VNID"
+            if [ "$NODE" == "$REQUEST_GW_NODE" ]; then
+                REQUEST_IPS[$i]="$REQUEST_GW_IP/$RANGE"
+            else
+                IP="$(echo "$NET" | awk '{split($0,a,"\."); print a[1]}' 2>/dev/null).$(echo "$NET" | awk '{split($0,a,"\."); print a[2]}' 2>/dev/null).$(echo "$NET" | awk '{split($0,a,"\."); print a[3]}' 2>/dev/null)"
+                HOST=$((BASE+IDX))
+                IDX=$((IDX+1))
+                if [ "$REQUEST_GW_IP" == "$IP.$HOST" ]; then
+                    # collision avoidance
+                    HOST=$((BASE+IDX))
+                    IDX=$((IDX+1))
+                fi
+                IP="$IP.$HOST/$RANGE"
+                REQUEST_IPS[$i]=$IP
+            fi
+        done
     fi
 }
 
-function ExtractParamFromYaml() {
-    CONFIG=$1
+function PrintConfigRequestNetwork() {
+    echo "[NODES, cidr=$REQUEST_CIDR, vnid=$REQUEST_VNID, port=$REQUEST_PORT]"
+    for (( i = 0; i < ${#REQUEST_NODES[@]}; i++ )); do
+        NODE=${REQUEST_NODES[$i]}
+        IP=${REQUEST_IPS[$i]}
+        if [ "$NODE" == "$REQUEST_GW_NODE" ]; then
+            echo "[$i] [$REQUEST_PARENT_DEV=$NODE, $REQUEST_VXLAN_DEV=$IP, gateway]"
+        else
+            echo "[$i] [$REQUEST_PARENT_DEV=$NODE, $REQUEST_VXLAN_DEV=$IP]"
+        fi
+    done
 
-    REQUEST_VXLAN_DEV=$(grep "dev" "$CONFIG" 2>/dev/null | awk '{print $2}')
-    REQUEST_PARENT_DEV=$(grep "parent" "$CONFIG" 2>/dev/null | awk '{print $2}')
-    REQUEST_VNID=$(grep "vnid" "$CONFIG" 2>/dev/null | awk '{print $2}')
-    REQUEST_CIDR=$(grep "cidr" "$CONFIG" 2>/dev/null | awk '{print $2}')
-    REQUEST_PORT=$(grep "port" "$CONFIG" 2>/dev/null | awk '{print $2}')
-
-    REQUEST_NODES=()
-    REQUEST_IPS=()
-    REQUEST_ROUTE_VIA=()
-
-    RANGE=$(echo "$REQUEST_CIDR" | awk '{split($0,a,"/"); print a[2]}')
-    if [ -z "$RANGE" ]; then
-        RANGE=24
+    if [ $((${#REQUEST_ROUTE_TO[@]}+${#REQUEST_ROUTE_VIA[@]})) -eq 0 ]; then
+        return 0
     fi
 
-    NODES_START_FROM=$(awk '/nodes:/{print NR}' "$CONFIG")
-    NODES_CFG="$(awk "NR>$NODES_START_FROM" "$CONFIG")"
+    echo "[MORE ROUTES]"
+    idx=0
+    for (( i = 0; i < ${#REQUEST_ROUTE_TO[@]}; i++ )); do
+        echo "[$idx] [${REQUEST_ROUTE_TO[$i]} dev $REQUEST_VXLAN_DEV]"
+        idx=$((idx+1))
+    done
+    for (( i = 0; i < ${#REQUEST_ROUTE_VIA[@]}; i++ )); do
+        echo "[$idx] [${REQUEST_ROUTE_VIA[$i]} dev $REQUEST_VXLAN_DEV via $REQUEST_GW_IP onlink]"
+        idx=$((idx+1))
+    done
 
-    declare -i idx=-1
-
-    while read -r config || [ -n "$config" ]
-    do
-        if [ -z "$config" ]; then
-            continue
-        fi
-
-        if [[ $config == -* ]]; then
-            idx+=1
-            config=${config#"-"}
-        fi
-
-        key=$(echo "$config" | awk '{print $1}')
-        key=${key%":"}
-        val=$(echo "$config" | awk '{print $2}')
-
-        case $key in
-        node)
-          REQUEST_NODES[$idx]=$val
-          ;;
-        ip)
-          if [ -z "$(echo "$val" | awk '{split($0,a,"/"); print a[2]}')" ]; then
-              val="$val/$RANGE"
-          fi
-          REQUEST_IPS[$idx]=$val
-          ;;
-        gateway)
-          if [ "$val" == "true" ]; then
-              REQUEST_GATEWAY_NODE=$idx
-          fi
-          ;;
-        esac
-    done <<< "$NODES_CFG"
-
-    #REQUEST_GATEWAY_NODE=${REQUEST_NODES[$REQUEST_GATEWAY_NODE]}
 }
 
 function LiteConfigRequestNetwork() {
@@ -313,15 +246,13 @@ function LiteConfigRequestNetwork() {
     done
 
     ROUTE=''
-    for i in "${!REQUEST_ROUTE_VIA[@]}"
-    do
-      TO="$i"
-      VIA="${REQUEST_ROUTE_VIA[$i]}"
-      if [ -n "$VIA" ]; then
-          ROUTE="$ROUTE && sudo ip route replace $TO dev $REQUEST_VXLAN_DEV via $VIA onlink"
-      else
-          ROUTE="$ROUTE && sudo ip route replace $TO dev $REQUEST_VXLAN_DEV"
-      fi
+    for (( i = 0; i < ${#REQUEST_ROUTE_TO[@]}; i++ )); do
+        ROUTE="$ROUTE && sudo ip route replace ${REQUEST_ROUTE_TO[$i]} dev $REQUEST_VXLAN_DEV"
+    done
+
+    EX_ROUTE=''
+    for (( i = 0; i < ${#REQUEST_ROUTE_VIA[@]}; i++ )); do
+        EX_ROUTE="$EX_ROUTE && sudo ip route replace ${REQUEST_ROUTE_VIA[$i]} dev $REQUEST_VXLAN_DEV via $REQUEST_GW_IP onlink"
     done
 
 
@@ -329,11 +260,20 @@ function LiteConfigRequestNetwork() {
         NODE=${REQUEST_NODES[$i]}
         IP=${REQUEST_IPS[$i]}
 
-        echo "[$i] calling slave on $NODE:"
-        if [ -n "$IP" ]; then
-            REMOTE_CALL="$DEL_IF_EXISTS && $SETUP && sudo ip addr add $IP dev $REQUEST_VXLAN_DEV $FDB $ROUTE"
+        if [ "$NODE" == "$REQUEST_GW_NODE" ]; then
+            echo "[$i] calling slave on gw $NODE:"
+            if [ -n "$IP" ]; then
+                REMOTE_CALL="$DEL_IF_EXISTS && $SETUP && sudo ip addr add $IP dev $REQUEST_VXLAN_DEV $FDB $ROUTE"
+            else
+                REMOTE_CALL="$DEL_IF_EXISTS && $SETUP $FDB $ROUTE"
+            fi
         else
-            REMOTE_CALL="$DEL_IF_EXISTS && $SETUP $FDB $ROUTE"
+            echo "[$i] calling slave on node $NODE:"
+            if [ -n "$IP" ]; then
+                REMOTE_CALL="$DEL_IF_EXISTS && $SETUP && sudo ip addr add $IP dev $REQUEST_VXLAN_DEV $FDB $ROUTE $EX_ROUTE"
+            else
+                REMOTE_CALL="$DEL_IF_EXISTS && $SETUP $FDB $ROUTE $EX_ROUTE"
+            fi
         fi
 
         # echo "$REMOTE_CALL"
@@ -345,66 +285,17 @@ function LiteConfigRequestNetwork() {
     done
 }
 
-function ConfigRequestNetwork() {
-    if [ $CHECK_CONFIG -ne 0 ]; then
-        echo "[$REQUEST_CIDR] [dev=$REQUEST_VXLAN_DEV, parent=$REQUEST_PARENT_DEV, vnid=$REQUEST_VNID, port=$REQUEST_PORT]"
-        for (( i = 0; i < ${#REQUEST_NODES[@]}; i++ )); do
-            NODE=${REQUEST_NODES[$i]}
-            IP=${REQUEST_IPS[$i]}
-            IS_GATEWAY='no'
-            if [ "$NODE" == "$REQUEST_GATEWAY_NODE" ]; then
-                IS_GATEWAY='yes'
-            fi
-            echo "[$i] [node=$NODE, ip=$IP, is-gateway=$IS_GATEWAY]"
-        done
-
-        read -r -n1 -p "Proceed[y/n]: " proceed
-        echo ""
-        if [ "$proceed" != "y" ]; then
-            echo "quit this underlay network config"
-            return 1
-        fi
-    fi
-
-    SLAVE_CLIENT="$PACKAGE-slave"
-    cp "$PACKAGE" "$SLAVE_CLIENT"
-    SLAVE_SET=""
+function RemoveConfigRequestNetwork() {
+    # shellcheck disable=SC2016
+    LINK_CHECK='$(ip link show type vxlan)'
+    DEL_IF_EXISTS="if grep -q $REQUEST_VXLAN_DEV <<< $LINK_CHECK; then sudo ip link del $REQUEST_VXLAN_DEV; fi"
 
     for (( i = 0; i < ${#REQUEST_NODES[@]}; i++ )); do
         NODE=${REQUEST_NODES[$i]}
-        SLAVE_SET="$SLAVE_SET $NODE"
-        scp "$SLAVE_CLIENT" root@"$NODE":. > /dev/null
-    done
+        REMOTE_CALL=$DEL_IF_EXISTS
 
-    echo "all slave client sent!"
-
-    if [ $EXECUTE_AFTER_DEPLOY -ne 1 ]; then
-        echo "quit execute slave"
-        return 0
-    fi
-
-    for (( i = 0; i < ${#REQUEST_NODES[@]}; i++ )); do
-        SLAVE_ARGS="--underlay-dev=$REQUEST_VXLAN_DEV --parent-dev=$REQUEST_PARENT_DEV --net-id=$REQUEST_VNID --udp-port=$REQUEST_PORT"
-
-        if [ $FORCE_SETUP_IF_EXISTS -ne 0 ]; then
-            SLAVE_ARGS="$SLAVE_ARGS --force"
-        fi
-
-        NODE=${REQUEST_NODES[$i]}
-        IP=${REQUEST_IPS[$i]}
-
-        if [ -n "$IP" ]; then
-            SLAVE_ARGS="$SLAVE_ARGS --local-underlay-ip=$IP"
-        fi
-
-        #if [ "$NODE" == "$REQUEST_GATEWAY_NODE" ]; then
-        #    SLAVE_ARGS="$SLAVE_ARGS --as-gateway=$CIDR"
-        #fi
-
-        SLAVE_ARGS="$SLAVE_ARGS $SLAVE_SET"
-
-        echo "[$i] calling slave on $NODE:"
-        REMOTE_CALL="./$SLAVE_CLIENT slave $SLAVE_ARGS"
+        # echo "$REMOTE_CALL"
+        # echo "remote-call: $REMOTE_CALL"
         if [ $SHOW_REMOTE_CALL -ne 0 ]; then
             echo "$REMOTE_CALL"
         fi
@@ -440,210 +331,38 @@ function ssh-auth() {
     done
 }
 
-function master() {
+function describe() {
     while test $# -gt 0; do
       case "$1" in
           -h|--help)
-          echo "$PACKAGE-master - master client for underlay mocker using vxlan tunnel"
-          echo " "
-          echo "$PACKAGE master [options] using [files]"
-          echo "$PACKAGE master [options] auto [parameters] [nodes]"
-          echo " "
-          echo "options:"
-          echo "-h, --help                   show brief help"
-          echo "--check-config               display underlay network config and decide whether to proceed"
-          echo "--force                      force to set up an underlay device even if it already exists"
-          echo "--no-execute-slave           do not execute slave client after the deployment"
-          exit 0
-          ;;
-        --check-config)
-          CHECK_CONFIG=1
-          shift
-          ;;
-        --force)
-          FORCE_SETUP_IF_EXISTS=1
-          shift
-          ;;
-        --no-execute-slave)
-          EXECUTE_AFTER_DEPLOY=0
-          shift
-          ;;
-        *)
-          break
-          ;;
-      esac
-    done
-
-    LOAD_STYLE=$1
-    shift
-
-    case $LOAD_STYLE in
-    using)
-      while test $# -gt 0; do
-          CONFIG=$1
-          if [ ! -f "$CONFIG" ]; then
-              echo "file not exists: $CONFIG"
-              exit 1
-          fi
-          ExtractParamFromYaml "$CONFIG"
-          ConfigRequestNetwork
-          echo "$CONFIG configured!"
-          shift
-      done
-      ;;
-    auto)
-       while test $# -gt 0; do
-        case "$1" in
-            -h|--help)
-              echo "$PACKAGE-master-auto - auto-configured master client for underlay mocker using vxlan tunnel"
-              echo " "
-              echo "$PACKAGE master auto [parameters] [nodes]"
-              echo "$PACKAGE master --force auto [parameters] [nodes]"
-              echo " "
-              break
-              ;;
-            *)
-              break
-              ;;
-        esac
-      done
-      AUTO_CONFIG_VNID=1
-      ReadParamFromFlags "$@"
-      ConfigRequestNetwork
-      echo "auto underlay network configured!"
-      ;;
-    *)
-      echo "unknown operation"
-      exit 1
-      ;;
-    esac
-}
-
-function slave() {
-    VXLAN_DEV=""
-    PARENT_DEV=""
-    VNID=""
-    PORT=""
-    UNDERLAY_IP=""
-    ROUTE_TO=()
-    ROUTE_VIA=()
-
-    while test $# -gt 0; do
-      case "$1" in
-          -h|--help)
-          echo "$PACKAGE-slave - slave client for underlay mocker using vxlan tunnel"
-          echo " "
-          echo "$PACKAGE slave [options] [nodes]"
-          echo " "
-          echo "options:"
-          echo "-h, --help                   show brief help"
-          echo "--local-underlay-ip=IP       set an underlay network ip for this node"
-          echo "--underlay-dev=DEV_NAME      designate a name for the device on underlay network"
-          echo "--parent-dev=DEV_NAME        specify the parent device from which underlay device is derived"
-          echo "--net-id=ID                  specify the vnid for vxlan tunnel for underlay traffic"
-          echo "--udp-port=PORT              specify the udp port of vxlan tunnel for underlay traffic"
-          echo "--route-to=CIDR              add an additional route to CIDR on underlay device"
-          echo "--route-via=IP,CIDR          add an additional route to CIDR on underlay device and specify the gateway"
-          echo "--force                      force to set up an underlay device even if it already exists"
-          exit 0
-          ;;
-        --local-underlay-ip*)
-          UNDERLAY_IP=`echo $1 | sed -e 's/^[^=]*=//g'`
-          shift
-          ;;
-        --underlay-dev*)
-          VXLAN_DEV=`echo $1 | sed -e 's/^[^=]*=//g'`
-          shift
-          ;;
-        --parent-dev*)
-          PARENT_DEV=`echo $1 | sed -e 's/^[^=]*=//g'`
-          shift
-          ;;
-        --net-id*)
-          VNID=`echo $1 | sed -e 's/^[^=]*=//g'`
-          shift
-          ;;
-        --udp-port*)
-          PORT=`echo $1 | sed -e 's/^[^=]*=//g'`
-          shift
-          ;;
-        --route-to*)
-          ROUTE_TO+=("`echo $1 | sed -e 's/^[^=]*=//g'`")
-          shift
-          ;;
-        --route-via*)
-          ROUTE_VIA+=("`echo $1 | sed -e 's/^[^=]*=//g'`")
-          shift
-          ;;
-        --force)
-          FORCE_SETUP_IF_EXISTS=1
-          shift
-          ;;
-        *)
-          break
-          ;;
-      esac
-    done
-
-    SetUpVxLAN "$PARENT_DEV" "$VXLAN_DEV" "$VNID" "$PORT"
-    EnableForwarding
-
-    case $RET_VAL in
-    0)
-      echo "  [1] $VXLAN_DEV installed!"
-      ;;
-    1)
-      echo "  [1] $VXLAN_DEV already exists, skip this step."
-      ;;
-    2)
-      echo "  [1] vnid $VNID has been occupied, abort."
-      exit 1
-      ;;
-    *)
-      echo "  [1] config of $VXLAN_DEV has changed, try add '--force' if you insist, abort."
-      exit 1
-      ;;
-    esac
-
-    if [ -n "$UNDERLAY_IP" ]; then
-        AssignIP "$VXLAN_DEV" "$UNDERLAY_IP"
-        if [ $RET_VAL -ne 0 ]; then
-            echo "  [1] $UNDERLAY_IP already assigned to $VXLAN_DEV, skip this step."
-        else
-            echo "  [1] Assign $UNDERLAY_IP to $VXLAN_DEV!"
-        fi
-    fi
-
-    while test $# -gt 0; do
-      AppendNewFDBEntry "$VXLAN_DEV" "$1"
-      shift
-    done
-
-    echo "  [2] fdb on dev $VXLAN_DEV configured!"
-
-    for (( i = 0; i < ${#ROUTE_TO[@]}; i++ )); do
-        TO=${ROUTE_TO[$i]}
-        ReplaceRouteCidr "$VXLAN_DEV" "$TO"
-    done
-
-    for (( i = 0; i < ${#ROUTE_VIA[@]}; i++ )); do
-        VIA=${ROUTE_VIA[$i]}
-        VIA_IP=$(echo "$VIA" | awk '{split($0,a,","); print a[1]}')
-        TO=$(echo "$VIA" | awk '{split($0,a,","); print a[2]}')
-        ReplaceRouteCidr "$VXLAN_DEV" "$TO" "$VIA"
-    done
-
-    echo "  [3] underlay network config: done"
-}
-
-function lite() {
-    while test $# -gt 0; do
-      case "$1" in
-          -h|--help)
-            echo "$PACKAGE-lite - lightweight client for underlay mocker using vxlan tunnel"
+            echo "$PACKAGE-describe - describe config of the underlay network"
             echo " "
-            echo "$PACKAGE lite [-h|--help]"
-            echo "$PACKAGE lite [-v|--verbose] [parameters] [nodes]"
+            echo "$PACKAGE describe [-h|--help]"
+            echo "$PACKAGE describe [parameters] [nodes]"
+            echo "$PACKAGE describe [parameters] [gw:gateway_node] [other_nodes]"
+            echo " "
+            break
+            ;;
+          *)
+            break
+            ;;
+      esac
+    done
+    AUTO_CONFIG_VNID=1
+    ReadParamFromFlags "$@"
+    PrintConfigRequestNetwork
+}
+
+function install() {
+    while test $# -gt 0; do
+      case "$1" in
+          -h|--help)
+            echo "$PACKAGE-install - mocking an underlay network using vxlan tunnel"
+            echo " "
+            echo "$PACKAGE install [-h|--help]"
+            echo "$PACKAGE install [-v|--verbose] [parameters] [nodes]"
+            echo "$PACKAGE install [-v|--verbose] [parameters] [gw:gateway_node] [other_nodes]"
+            echo " "
             break
             ;;
           -v|--verbose)
@@ -659,7 +378,34 @@ function lite() {
     AUTO_CONFIG_VNID=1
     ReadParamFromFlags "$@"
     LiteConfigRequestNetwork
-    echo "auto underlay network configured!"
+    echo "underlay network installed!"
+}
+
+function remove() {
+    while test $# -gt 0; do
+      case "$1" in
+          -h|--help)
+            echo "$PACKAGE-remove - remove the mocking underlay network"
+            echo " "
+            echo "$PACKAGE remove [-h|--help]"
+            echo "$PACKAGE remove [-v|--verbose] [parameters] [nodes]"
+            echo " "
+            break
+            ;;
+          -v|--verbose)
+            SHOW_REMOTE_CALL=1
+            shift
+            break
+            ;;
+          *)
+            break
+            ;;
+      esac
+    done
+    AUTO_CONFIG_VNID=1
+    ReadParamFromFlags "$@"
+    RemoveConfigRequestNetwork
+    echo "underlay network removed!"
 }
 
 function help() {
@@ -669,14 +415,14 @@ function help() {
     echo " "
     echo "tools:"
     echo "ssh-auth              authenticate ssh connection towards those nodes"
-    echo "master                master-client of underlay mocker, for slave deploying and config distributing"
-    echo "slave                 slave-client of underlay mocker, for concrete setting"
-    echo "lite                  lightweight client of underlay mocker without slave deploying"
+    echo "describe              describe config of the underlay network"
+    echo "install               mocking an underlay network using vxlan tunnel"
+    echo "remove                remove the mocking underlay network"
     echo " "
     echo "How to use $PACKAGE to mock an underlay network on VPC:"
     echo "1. copy \"underlayctl\" and your underlay network config to one of your VPC nodes"
     echo "2. use tool \"ssh-auth\" to generate ssh key"
-    echo "3. use tool \"master\" or \"lite\" to specify underlay network config. It will finish rest jobs."
+    echo "3. use tool \"install\" to install underlay network config. It will finish rest jobs."
 }
 
 if [ $# == 0 ]; then
@@ -693,17 +439,17 @@ case "$1" in
     shift
     ssh-auth "$@"
     ;;
-  master)
+  describe)
     shift
-    master "$@"
+    describe "$@"
     ;;
-  slave)
+  install)
     shift
-    slave "$@"
+    install "$@"
     ;;
-  lite)
+  remove)
     shift
-    lite "$@"
+    remove "$@"
     ;;
   *)
     echo "cannot recognize tool: $1"
